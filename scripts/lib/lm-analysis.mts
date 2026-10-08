@@ -1,5 +1,7 @@
 import type { ChangeGrouping } from "./change-groups.mjs";
 import type { PatchAnalysis } from "./preflight.mjs";
+import { parseUnifiedDiff } from "./diff-parse.mjs";
+import { DiagnosticError, type Diagnostic } from "./diagnostics.mjs";
 
 export const ANALYSIS_INPUT_VERSION = 1;
 export const ANALYSIS_MODES = Object.freeze(["lm-analysis", "deep-audit"] as const);
@@ -70,8 +72,10 @@ export interface AnalysisInput {
 }
 
 export interface AnalysisFinding {
-  file: string;
-  line: number | `o${number}`;
+  /** Row ID from the patch (`file#h0:a12` or `file#h0:d7`); an alternative to file plus line. */
+  row?: string;
+  file?: string;
+  line?: number | `o${number}`;
   severity: FindingSeverity;
   body: string;
   confidence: number;
@@ -86,11 +90,88 @@ export interface AnalysisResult {
   findings: AnalysisFinding[];
 }
 
-export interface AnalysisDiagnostic {
+export interface AnalysisDiagnostic extends Diagnostic {
   level: "error";
-  code: string;
-  path: string;
-  message: string;
+}
+
+export interface ReviewFinding extends Omit<AnalysisFinding, "row" | "file" | "line"> {
+  file: string;
+  line: number | `o${number}`;
+}
+
+/** Every line a finding may anchor to: changed rows by ID plus new/old line numbers per file. */
+export interface DiffAnchors {
+  rows: Set<string>;
+  newLines: Map<string, Set<number>>;
+  oldLines: Map<string, Set<number>>;
+}
+
+function addLine(map: Map<string, Set<number>>, file: string, line: number): void {
+  const lines = map.get(file) ?? new Set<number>();
+  lines.add(line);
+  map.set(file, lines);
+}
+
+/** Build the anchor set from the actual patch: added, deleted, and context rows. */
+export function diffAnchorsFromPatch(patch: string): DiffAnchors {
+  const anchors: DiffAnchors = { rows: new Set(), newLines: new Map(), oldLines: new Map() };
+  for (const parsed of parseUnifiedDiff(patch)) {
+    const file = parsed.path.replaceAll("\\", "/");
+    parsed.hunks.forEach((hunk, hunkIndex) => {
+      for (const line of hunk.lines) {
+        if (line.newNo !== undefined) addLine(anchors.newLines, file, line.newNo);
+        if (line.oldNo !== undefined) addLine(anchors.oldLines, file, line.oldNo);
+        if (line.kind === "add") anchors.rows.add(`${file}#h${hunkIndex}:a${line.newNo}`);
+        if (line.kind === "del") anchors.rows.add(`${file}#h${hunkIndex}:d${line.oldNo}`);
+      }
+    });
+  }
+  return anchors;
+}
+
+const ROW_ID_RE = /^(.+)#h(\d+):([ad])([1-9]\d*)$/;
+
+export function parseRowId(
+  row: string,
+): { file: string; hunk: number; side: "a" | "d"; line: number } | null {
+  const match = ROW_ID_RE.exec(String(row));
+  if (!match) return null;
+  return {
+    file: match[1],
+    hunk: Number(match[2]),
+    side: match[3] as "a" | "d",
+    line: Number(match[4]),
+  };
+}
+
+/** Fall back to the inventory's changed rows when the patch text is unavailable. */
+function diffAnchorsFromInventory(
+  inventory: ChangeGrouping["inventory"] | undefined,
+): DiffAnchors | null {
+  if (!(inventory || []).some((change) => Array.isArray(change.rows))) return null;
+  const anchors: DiffAnchors = { rows: new Set(), newLines: new Map(), oldLines: new Map() };
+  for (const change of inventory || []) {
+    for (const row of change.rows || []) {
+      const parsed = parseRowId(row);
+      if (!parsed) continue;
+      anchors.rows.add(row);
+      addLine(parsed.side === "a" ? anchors.newLines : anchors.oldLines, parsed.file, parsed.line);
+    }
+  }
+  return anchors;
+}
+
+/** Resolve a finding's row reference to the file/line form the review spec uses. */
+export function findingAnchor(
+  finding: AnalysisFinding,
+): { file: string; line: number | `o${number}` } | null {
+  if (typeof finding.row === "string") {
+    const parsed = parseRowId(finding.row);
+    if (!parsed) return null;
+    return { file: parsed.file, line: parsed.side === "a" ? parsed.line : `o${parsed.line}` };
+  }
+  if (typeof finding.file !== "string" || finding.line === undefined) return null;
+  return { file: finding.file, line: finding.line };
 }
 const REQUIRED_FINDING_FIELDS = Object.freeze([
   "file",
@@ -101,7 +182,7 @@ const REQUIRED_FINDING_FIELDS = Object.freeze([
   "rationale",
   "options",
 ]);
-const FINDING_FIELDS = new Set([...REQUIRED_FINDING_FIELDS, "suggestedChange"]);
+const FINDING_FIELDS = new Set([...REQUIRED_FINDING_FIELDS, "row", "suggestedChange"]);
 const FINDING_SEVERITIES = new Set([
   "nit",
   "suggestion",
@@ -289,18 +370,31 @@ function requireValidAnalysisInput(input: AnalysisInput): void {
   }
 }
 
+export interface AnalysisValidationOptions {
+  /** The reviewed patch; enables exact anchors including context rows. */
+  patch?: string;
+  anchors?: DiffAnchors;
+}
+
 export function validateAnalysisResult(
   result: AnalysisResult,
   input: AnalysisInput,
+  options: AnalysisValidationOptions = {},
 ): { valid: boolean; diagnostics: AnalysisDiagnostic[] } {
   const diagnostics: AnalysisDiagnostic[] = [];
-  const add = (code: string, path: string, message: string): number =>
+  const add = (code: string, path: string, message: string, hint?: string): number =>
     diagnostics.push({
       level: "error",
       code,
       path,
       message,
+      ...(hint ? { hint } : {}),
     });
+  const anchors =
+    options.anchors ??
+    (options.patch !== undefined
+      ? diffAnchorsFromPatch(options.patch)
+      : diffAnchorsFromInventory(input?.facts?.changeGroups?.inventory));
   const findings = Array.isArray(result?.findings) ? result.findings : [];
   if (!VERDICTS.has(result?.verdict)) {
     add("invalid-verdict", "verdict", "Use approve, comment, or request-changes.");
@@ -330,36 +424,73 @@ export function validateAnalysisResult(
         );
       }
     }
-    if (typeof finding?.file !== "string" || !finding.file.trim()) {
-      add("missing-finding-field", `${root}.file`, "A finding must identify a file.");
-    }
-    const validLine =
-      (typeof finding?.line === "number" && Number.isInteger(finding.line) && finding.line > 0) ||
-      (typeof finding?.line === "string" && /^o[1-9]\d*$/.test(finding.line));
-    if (!validLine) {
-      add(
-        "invalid-line-anchor",
-        `${root}.line`,
-        "Use a positive new line or an old-line anchor such as 'o7'.",
-      );
-    } else {
-      const oldSide = typeof finding.line === "string";
-      const line = typeof finding.line === "string" ? Number(finding.line.slice(1)) : finding.line;
-      const rangeKey: "oldRange" | "newRange" = oldSide ? "oldRange" : "newRange";
-      const anchored = (input?.facts?.changeGroups?.inventory || []).some(
-        (change) =>
-          change.file === finding.file &&
-          change[rangeKey] &&
-          change[rangeKey].count !== 0 &&
-          line >= change[rangeKey].start &&
-          line <= change[rangeKey].end,
-      );
-      if (!anchored) {
+    if (finding?.row !== undefined) {
+      if (finding.file !== undefined || finding.line !== undefined) {
+        add(
+          "ambiguous-anchor",
+          `${root}.row`,
+          "Use either row or file plus line, not both.",
+          "Keep row and remove file and line.",
+        );
+      }
+      const parsed = typeof finding.row === "string" ? parseRowId(finding.row) : null;
+      if (!parsed) {
+        add(
+          "invalid-row-anchor",
+          `${root}.row`,
+          `Row '${String(finding.row)}' is not a row ID.`,
+          "Copy a row ID such as 'src/a.ts#h0:a12' from the patch.",
+        );
+      } else if (anchors && !anchors.rows.has(finding.row)) {
         add(
           "anchor-not-in-diff",
-          `${root}.line`,
-          `Finding anchor '${finding.file}:${finding.line}' is not inside a changed hunk range.`,
+          `${root}.row`,
+          `Row '${finding.row}' is not an added or removed row in the diff.`,
+          "Copy an existing row ID, or anchor a context line with file and line.",
         );
+      }
+    } else {
+      if (typeof finding?.file !== "string" || !finding.file.trim()) {
+        add(
+          "missing-finding-field",
+          `${root}.file`,
+          "A finding must identify a file.",
+          "Use row, or file plus line.",
+        );
+      }
+      const validLine =
+        (typeof finding?.line === "number" && Number.isInteger(finding.line) && finding.line > 0) ||
+        (typeof finding?.line === "string" && /^o[1-9]\d*$/.test(finding.line));
+      if (!validLine) {
+        add(
+          "invalid-line-anchor",
+          `${root}.line`,
+          "Use a positive new line or an old-line anchor such as 'o7'.",
+        );
+      } else if (typeof finding.file === "string") {
+        const oldSide = typeof finding.line === "string";
+        const line =
+          typeof finding.line === "string" ? Number(finding.line.slice(1)) : Number(finding.line);
+        const anchored = anchors
+          ? Boolean((oldSide ? anchors.oldLines : anchors.newLines).get(finding.file)?.has(line))
+          : (input?.facts?.changeGroups?.inventory || []).some((change) => {
+              const range = change[oldSide ? "oldRange" : "newRange"];
+              return (
+                change.file === finding.file &&
+                range !== null &&
+                range.count !== 0 &&
+                line >= range.start &&
+                line <= range.end
+              );
+            });
+        if (!anchored) {
+          add(
+            "anchor-not-in-diff",
+            `${root}.line`,
+            `Finding anchor '${finding.file}:${finding.line}' is not a line shown in the diff.`,
+            "Anchor to an added, removed ('o' + old line), or context line of that file's hunks.",
+          );
+        }
       }
     }
     if (!FINDING_SEVERITIES.has(finding?.severity)) {
@@ -427,16 +558,21 @@ export function validateAnalysisResult(
 export function analysisResultToReview(
   result: AnalysisResult,
   input: AnalysisInput,
-): { verdict: ReviewVerdict; global: string; comments: AnalysisFinding[] } {
+  options: AnalysisValidationOptions = {},
+): { verdict: ReviewVerdict; global: string; comments: ReviewFinding[] } {
   requireValidAnalysisInput(input);
-  const validation = validateAnalysisResult(result, input);
+  const validation = validateAnalysisResult(result, input, options);
   if (!validation.valid) {
-    const detail = validation.diagnostics.map((item) => `${item.path}: ${item.message}`).join("; ");
-    throw new Error(`Invalid LM analysis result: ${detail}`);
+    throw new DiagnosticError("Invalid LM analysis result:", validation.diagnostics);
   }
   return {
     verdict: result.verdict,
     global: result.global,
-    comments: result.findings,
+    comments: result.findings.map((finding) => {
+      const { row: _row, file: _file, line: _line, ...rest } = finding;
+      const anchor = findingAnchor(finding);
+      if (!anchor) throw new Error("Validated finding anchor is missing.");
+      return { file: anchor.file, line: anchor.line, ...rest };
+    }),
   };
 }

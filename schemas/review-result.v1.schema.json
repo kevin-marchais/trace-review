@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/kmarchais/trace-review/schemas/review-result.v1.schema.json",
+  "title": "Trace Review combined result",
+  "description": "The one result a language model writes. Workspace mode omits review; lm-analysis and deep-audit require it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "groups"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "pattern": "\\S",
+      "description": "Markdown summary of the whole change."
+    },
+    "groupingProvenance": {
+      "type": "string",
+      "enum": ["deterministic"],
+      "description": "Set only by the deterministic quick path."
+    },
+    "groups": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/group" },
+      "description": "Semantic review groups."
+    },
+    "review": { "$ref": "#/$defs/review" }
+  },
+  "$defs": {
+    "text": { "type": "string", "pattern": "\\S" },
+    "group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "intent",
+        "risk",
+        "confidence",
+        "evidence",
+        "reviewerChecks",
+        "titleEvidence"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "pattern": "\\S",
+          "description": "Change-specific title; never a classifier label such as Definitions."
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["mechanical", "refactor", "feature", "fix", "test", "docs", "other"]
+        },
+        "intent": { "$ref": "#/$defs/text" },
+        "risk": { "type": "string", "enum": ["low", "medium", "high"] },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "evidence": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "reviewerChecks": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "titleEvidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["changeIds", "rationale"],
+          "properties": {
+            "changeIds": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string" },
+              "description": "Change IDs assigned to this group that ground the title."
+            },
+            "rationale": { "$ref": "#/$defs/text" }
+          }
+        },
+        "from": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^g[1-9][0-9]*$" },
+          "description": "Candidate group IDs whose changes all join this group."
+        },
+        "changeIds": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Individual change IDs; they move here even when another group lists their candidate group in from."
+        },
+        "readAfter": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Titles of groups to read first."
+        }
+      },
+      "anyOf": [
+        { "required": ["from"], "properties": { "from": { "minItems": 1 } } },
+        { "required": ["changeIds"], "properties": { "changeIds": { "minItems": 1 } } }
+      ]
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict", "global", "findings"],
+      "properties": {
+        "verdict": { "type": "string", "enum": ["approve", "comment", "request-changes"] },
+        "global": {
+          "type": "string",
+          "pattern": "\\S",
+          "description": "Markdown overall assessment."
+        },
+        "findings": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/finding" },
+          "description": "Sparse, actionable findings; an empty array is valid."
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["severity", "body", "confidence", "rationale", "options"],
+      "properties": {
+        "row": {
+          "type": "string",
+          "pattern": "#h[0-9]+:[ad][1-9][0-9]*$",
+          "description": "Row ID from the patch, such as src/a.ts#h0:a12 (added) or src/a.ts#h0:d7 (removed)."
+        },
+        "file": { "type": "string", "pattern": "\\S" },
+        "line": {
+          "anyOf": [
+            { "type": "integer", "minimum": 1 },
+            { "type": "string", "pattern": "^o[1-9][0-9]*$" }
+          ],
+          "description": "New-file line number, or 'o' plus the old line number for a removed line."
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["nit", "suggestion", "concern", "question", "praise", "comment"]
+        },
+        "body": { "type": "string", "pattern": "\\S", "maxLength": 280 },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "rationale": { "type": "string", "pattern": "\\S", "maxLength": 180 },
+        "options": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "\\S", "maxLength": 64 },
+          "description": "Two to four distinct, finding-specific response options."
+        },
+        "suggestedChange": { "type": "string", "pattern": "\\S" }
+      },
+      "oneOf": [
+        { "required": ["row"], "not": { "anyOf": [{ "required": ["file"] }, { "required": ["line"] }] } },
+        { "required": ["file", "line"], "not": { "required": ["row"] } }
+      ],
+      "description": "Anchor with row, or with file plus line."
+    }
+  }
+}

@@ -11,6 +11,10 @@ execute repository content.
 
 ## Rule format
 
+The JSON Schema is
+[`schemas/detector-rules.v1.schema.json`](../schemas/detector-rules.v1.schema.json);
+`refine` checks it before parsing and also rejects duplicate rule IDs.
+
 ```json
 {
   "schemaVersion": 1,
@@ -52,8 +56,8 @@ transformation is still mixed into semantic changes:
      --rules .review/detector-rules.json
    ```
 
-3. Read the updated `analysis-input.json`, then write the normal combined
-   result and run `finish`.
+3. Read the regenerated `.review/lm/input.json`, then write the normal result
+   and run `finish`.
 
 Refinement records the rule count and SHA-256 hash in the analysis input and
 metrics. Invalid rule sets stop before matching. The generated review still
