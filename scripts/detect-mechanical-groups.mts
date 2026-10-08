@@ -5,7 +5,7 @@ import path from "node:path";
 import { analyzePatch } from "./lib/preflight.mjs";
 import { detectChangeGroups } from "./lib/change-groups.mjs";
 import { parseDetectorRuleSet } from "./lib/repeated-changes.mjs";
-import { errorMessage, parseJson } from "./lib/cli.mjs";
+import { errorMessage, parseJson, requiredValue } from "./lib/cli.mjs";
 
 interface Args {
   diff?: string;
@@ -26,9 +26,9 @@ const args: Args = {};
 const argv = process.argv.slice(2);
 for (let index = 0; index < argv.length; index++) {
   const arg = argv[index];
-  if (arg === "--diff") args.diff = argv[++index];
-  else if (arg === "--out") args.out = argv[++index];
-  else if (arg === "--rules") args.rules = argv[++index];
+  if (arg === "--diff") args.diff = requiredValue(argv, index++, arg, usage);
+  else if (arg === "--out") args.out = requiredValue(argv, index++, arg, usage);
+  else if (arg === "--rules") args.rules = requiredValue(argv, index++, arg, usage);
   else if (arg === "--help" || arg === "-h") args.help = true;
   else usage(`Unknown option: ${arg}`);
 }

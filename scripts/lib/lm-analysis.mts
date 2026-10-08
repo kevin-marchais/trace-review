@@ -127,8 +127,13 @@ function compactTarget(context: ReviewContext): {
   reviewComments: unknown[];
 } {
   const pullRequest = context.pullRequest || {};
+  // A PR's base repository comes from its URL; the local origin may be a fork.
+  const pullRequestRepository = /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/\d+/.exec(
+    pullRequest.url || "",
+  )?.[1];
   return {
     repository:
+      pullRequestRepository ||
       context.repository?.nameWithOwner ||
       [context.repository?.owner, context.repository?.name].filter(Boolean).join("/"),
     branch: context.git?.diffLabel || context.repository?.branch || context.git?.branch || "",

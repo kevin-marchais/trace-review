@@ -14,10 +14,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { execSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { performance } from "node:perf_hooks";
 import { formatReviewSpecDiagnostics, validateReviewSpec } from "./lib/review-spec.mjs";
 import { analyzePatch } from "./lib/preflight.mjs";
+import { parseUnifiedDiff } from "./lib/diff-parse.mjs";
 import {
   detectChangeGroups,
   extractDefinedSymbols,
@@ -25,7 +26,7 @@ import {
   validateGrouping,
 } from "./lib/change-groups.mjs";
 import { validateLmGroupingResult } from "./lib/lm-groups.mjs";
-import { errorMessage, parseJson } from "./lib/cli.mjs";
+import { errorMessage, parseJson, requiredValue } from "./lib/cli.mjs";
 import type { ChangeGroup, ChangeGrouping, GroupedChange } from "./lib/change-groups.mjs";
 import type { LmGroupingCandidate } from "./lib/lm-groups.mjs";
 import type { ReviewMode } from "./lib/review-spec.mjs";
@@ -145,7 +146,6 @@ interface ParsedDiffFile {
   meta: string[];
   isNew?: boolean;
   isDeleted?: boolean;
-  _hunk?: DiffHunk;
 }
 
 interface ClientRow {
@@ -260,14 +260,23 @@ const SKILL_DIR = path.resolve(__dirname, "..");
 const TEMPLATE = path.join(SKILL_DIR, "templates", "review.template.html");
 
 // ---------- args ----------
+function usageError(message: string): never {
+  console.error(`Error: ${message}`);
+  process.exit(1);
+}
+
+function optionValue(argv: readonly string[], index: number, option: string): string {
+  return requiredValue(argv, index, option, usageError);
+}
+
 function parseArgs(argv: readonly string[]): Args {
   const out: Args = { open: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--spec") out.spec = argv[++i];
-    else if (a === "--out") out.out = argv[++i];
+    if (a === "--spec") out.spec = optionValue(argv, i++, a);
+    else if (a === "--out") out.out = optionValue(argv, i++, a);
     else if (a === "--open") out.open = true;
-    else if (a === "--metrics-out") out.metricsOut = argv[++i];
+    else if (a === "--metrics-out") out.metricsOut = optionValue(argv, i++, a);
     else if (a === "--help" || a === "-h") out.help = true;
   }
   return out;
@@ -661,88 +670,25 @@ function pairWordDiffRows(
 
 // ---------- unified diff parser ----------
 function parseDiff(text: string): ParsedDiffFile[] {
-  const files: ParsedDiffFile[] = [];
-  if (!text || !text.trim()) return files;
-  const lines = text.replace(/\r\n?/g, "\n").split("\n");
-  let cur: ParsedDiffFile | null = null;
-  let oldNo = 0,
-    newNo = 0;
-  const pushFile = (p: string): ParsedDiffFile => {
-    const file: ParsedDiffFile = {
-      path: p,
-      oldPath: p,
-      hunks: [],
-      add: 0,
-      del: 0,
-      binary: false,
-      meta: [],
-    };
-    files.push(file);
-    return file;
-  };
-  for (let i = 0; i < lines.length; i++) {
-    const l = lines[i];
-    let m;
-    if ((m = /^diff --git a\/(.+?) b\/(.+)$/.exec(l))) {
-      cur = pushFile(m[2]);
-      cur.oldPath = m[1];
-      continue;
-    }
-    if (/^(index |old mode|new mode|similarity|rename from|rename to|dissimilarity) /.test(l)) {
-      if (cur) cur.meta.push(l);
-      continue;
-    }
-    if (/^new file mode/.test(l)) {
-      if (cur) cur.isNew = true;
-      continue;
-    }
-    if (/^deleted file mode/.test(l)) {
-      if (cur) cur.isDeleted = true;
-      continue;
-    }
-    if (/^Binary files? /.test(l)) {
-      if (!cur) cur = pushFile(l.replace(/^Binary files? a\/(.+?) and .*/, "$1"));
-      cur.binary = true;
-      continue;
-    }
-    if ((m = /^--- (?:a\/)?(.+)$/.exec(l))) {
-      if (!cur) cur = pushFile(m[1] === "/dev/null" ? "?" : m[1]);
-      if (m[1] !== "/dev/null") cur.oldPath = m[1];
-      continue;
-    }
-    if ((m = /^\+\+\+ (?:b\/)?(.+)$/.exec(l))) {
-      if (!cur) continue;
-      if (m[1] !== "/dev/null") cur.path = m[1];
-      else cur.isDeleted = true;
-      continue;
-    }
-    if ((m = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$/.exec(l))) {
-      oldNo = parseInt(m[1], 10);
-      newNo = parseInt(m[2], 10);
-      if (!cur) continue;
-      const hunk: DiffHunk = { header: m[3].trim(), rows: [] };
-      cur.hunks.push(hunk);
-      cur._hunk = hunk;
-      continue;
-    }
-    if (!cur || !cur._hunk) continue;
-    const kind = l[0];
-    const content = l.slice(1);
-    if (kind === "+") {
-      cur._hunk.rows.push({ type: "add", newNo, text: content });
-      newNo++;
-      cur.add++;
-    } else if (kind === "-") {
-      cur._hunk.rows.push({ type: "del", oldNo, text: content });
-      oldNo++;
-      cur.del++;
-    } else if (kind === " ") {
-      cur._hunk.rows.push({ type: "ctx", oldNo, newNo, text: content });
-      oldNo++;
-      newNo++;
-    }
-  }
-  return files;
+  return parseUnifiedDiff(text).map((file) => ({
+    path: file.path,
+    oldPath: file.oldPath,
+    hunks: file.hunks.map((hunk): DiffHunk => ({
+      header: hunk.section,
+      rows: hunk.lines.map((line) => ({
+        type: line.kind,
+        text: line.text,
+        ...(line.oldNo === undefined ? {} : { oldNo: line.oldNo }),
+        ...(line.newNo === undefined ? {} : { newNo: line.newNo }),
+      })),
+    })),
+    add: file.additions,
+    del: file.deletions,
+    binary: file.binary,
+    meta: file.meta,
+    ...(file.isNew ? { isNew: true } : {}),
+    ...(file.isDeleted ? { isDeleted: true } : {}),
+  }));
 }
 
 // pair consecutive del/add runs in a hunk for word-level highlighting
@@ -1629,21 +1575,20 @@ mermaid.initialize({ startOnLoad: true, theme: dark ? 'dark' : 'default', securi
   const reviewJson = JSON.stringify(reviewBag).replace(/</g, "\\u003c");
   const githubJson = JSON.stringify(githubBag).replace(/</g, "\\u003c");
 
-  let tpl = fs.readFileSync(TEMPLATE, "utf8");
-  const repl: Readonly<Record<string, string>> = {
-    "{{TITLE}}": esc(title),
-    "{{SUBTITLE}}": esc(`${generated} · ${prs.length} PR${prs.length === 1 ? "" : "s"} · ${mode}`),
-    "{{MODE}}": esc(mode),
-    "{{REVIEW_ID}}": esc(reviewId),
-    "{{TABS}}": tabs,
-    "{{SECTIONS}}": sections,
-    "{{DATA}}": dataJson,
-    "{{AIREVIEW}}": reviewJson,
-    "{{GITHUB_REVIEW}}": githubJson,
-    "{{REVIEWER}}": esc(reviewer),
-    "{{MERMAID}}": mermaid,
-  };
-  for (const [k, v] of Object.entries(repl)) tpl = tpl.split(k).join(v);
+  const tpl = renderTemplate(fs.readFileSync(TEMPLATE, "utf8"), {
+    html: {
+      TITLE: esc(title),
+      SUBTITLE: esc(`${generated} · ${prs.length} PR${prs.length === 1 ? "" : "s"} · ${mode}`),
+      MODE: esc(mode),
+      TABS: tabs,
+      SECTIONS: sections,
+      DATA: dataJson,
+      AIREVIEW: reviewJson,
+      GITHUB_REVIEW: githubJson,
+      MERMAID: mermaid,
+    },
+    js: { REVIEW_ID: reviewId, REVIEWER: reviewer },
+  });
 
   const outPath = path.resolve(args.out || "review.html");
   fs.writeFileSync(outPath, tpl, "utf8");
@@ -1684,21 +1629,45 @@ mermaid.initialize({ startOnLoad: true, theme: dark ? 'dark' : 'default', securi
     console.log(`Wrote ${metricsPath} (review measurement)`);
   }
 
-  if (args.open) {
-    try {
-      const cmd =
-        process.platform === "win32"
-          ? `start "" "${outPath}"`
-          : process.platform === "darwin"
-            ? `open "${outPath}"`
-            : `xdg-open "${outPath}"`;
-      execSync(cmd, {
-        shell: process.platform === "win32" ? process.env.ComSpec || "cmd.exe" : "/bin/sh",
-      });
-    } catch {
-      /* ignore */
-    }
+  if (args.open) openInBrowser(outPath);
+}
+
+// Open a file with the platform handler without going through a shell.
+function openInBrowser(file: string): void {
+  const [command, commandArgs] =
+    process.platform === "win32"
+      ? ["explorer.exe", [file]]
+      : process.platform === "darwin"
+        ? ["open", [file]]
+        : ["xdg-open", [file]];
+  try {
+    const child = spawn(command, commandArgs, { detached: true, stdio: "ignore" });
+    child.on("error", () => {});
+    child.unref();
+  } catch {
+    /* ignore */
   }
+}
+
+// Substitute every {{PLACEHOLDER}} in one pass so inserted content is never
+// rescanned. JS values are emitted as JSON string literals, replacing the
+// surrounding quotes when the template quotes the placeholder.
+function renderTemplate(
+  template: string,
+  values: { html: Readonly<Record<string, string>>; js: Readonly<Record<string, string>> },
+): string {
+  const jsString = (value: string): string => JSON.stringify(value).replace(/</g, "\\u003c");
+  return template.replace(
+    /(["'])\{\{([A-Z_]+)\}\}\1|\{\{([A-Z_]+)\}\}/g,
+    (match, _quote: string | undefined, quotedKey: string | undefined, key: string | undefined) => {
+      const name = quotedKey ?? key ?? "";
+      if (Object.hasOwn(values.js, name)) return jsString(values.js[name]);
+      if (!Object.hasOwn(values.html, name)) return match;
+      return quotedKey
+        ? `${match[0]}${values.html[name]}${match[match.length - 1]}`
+        : values.html[name];
+    },
+  );
 }
 
 main();

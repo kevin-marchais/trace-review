@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   GithubReviewPublicationError,
   githubReviewPreview,
+  parseGithubReviewPlan,
   prepareGithubReview,
   publishGithubReview,
   rangeStartMatchesAnchor,
@@ -285,4 +286,24 @@ test("publication reports a rejected GitHub review without losing the plan", asy
       error.message.includes("validation failed"),
   );
   assert.equal(plan.summary, "Review summary.");
+});
+
+test("publication plans reject repository names outside owner/name", () => {
+  const plan = prepareGithubReview(
+    {
+      repository: "acme/widgets.js",
+      pullRequest: 42,
+      headSha: "abc123",
+      url: "https://github.com/acme/widgets.js/pull/42",
+    },
+    { summary: "Review summary.", comments: [] },
+  );
+  const roundTripped = JSON.parse(JSON.stringify(plan));
+  assert.equal(parseGithubReviewPlan(roundTripped).target.repository, "acme/widgets.js");
+
+  for (const repository of ["acme/widgets?per_page=1", "acme/wid gets", "acme/widgets/pulls"]) {
+    assert.throws(() =>
+      parseGithubReviewPlan({ ...roundTripped, target: { ...roundTripped.target, repository } }),
+    );
+  }
 });

@@ -5,7 +5,7 @@ import path from "node:path";
 import { prepareAnalysisInput } from "./lib/lm-analysis.mjs";
 import type { AnalysisMode, ReviewContext } from "./lib/lm-analysis.mjs";
 import { ANALYSIS_MODES } from "./lib/lm-analysis.mjs";
-import { errorMessage, parseJson } from "./lib/cli.mjs";
+import { errorMessage, parseJson, requiredValue } from "./lib/cli.mjs";
 
 interface Args {
   context?: string;
@@ -36,14 +36,14 @@ function parseArgs(argv: readonly string[]): Args {
   const args: Args = { mode: "lm-analysis", explicit: false };
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index];
-    if (arg === "--context") args.context = argv[++index];
+    if (arg === "--context") args.context = requiredValue(argv, index++, arg, usage);
     else if (arg === "--mode") {
-      const mode = argv[++index];
+      const mode = requiredValue(argv, index++, arg, usage);
       if (!ANALYSIS_MODES.includes(mode as AnalysisMode)) {
         usage(`--mode must be one of: ${ANALYSIS_MODES.join(", ")}`);
       }
       args.mode = mode as AnalysisMode;
-    } else if (arg === "--out") args.out = argv[++index];
+    } else if (arg === "--out") args.out = requiredValue(argv, index++, arg, usage);
     else if (arg === "--explicit") args.explicit = true;
     else if (arg === "--help" || arg === "-h") args.help = true;
     else usage(`Unknown option: ${arg}`);

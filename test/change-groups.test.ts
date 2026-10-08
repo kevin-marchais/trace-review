@@ -371,3 +371,71 @@ test("review-spec validation accepts one Phase 2 group source and rejects ambigu
   assert.equal(result.valid, false);
   assert.ok(result.diagnostics.some((diagnostic) => diagnostic.code === "multiple-group-sources"));
 });
+
+function groupTitlesFor(text) {
+  const grouping = detectChangeGroups(text, analyzePatch(text));
+  return Object.fromEntries(
+    grouping.groups.flatMap((group) => group.changes.map((change) => [change.file, group.title])),
+  );
+}
+
+function singleHunk(file, deleted, added) {
+  return [
+    `diff --git a/${file} b/${file}`,
+    `--- a/${file}`,
+    `+++ b/${file}`,
+    `@@ -1,${deleted.length} +1,${added.length} @@`,
+    ...deleted.map((line) => `-${line}`),
+    ...added.map((line) => `+${line}`),
+    "",
+  ].join("\n");
+}
+
+test("indentation in indentation-sensitive files and CRLF changes are not formatting-only", () => {
+  const titles = groupTitlesFor(
+    singleHunk("app.py", ["    return value"], ["return value"]) +
+      singleHunk("ci.yaml", ["  run: test"], ["    run: test"]) +
+      singleHunk("Makefile", ["\tbuild"], ["        build"]) +
+      singleHunk("crlf.js", ["const value = 1;\r", "\r"], ["const value = 1;", ""]) +
+      singleHunk("layout.js", ["  let other = 2;"], ["    let other = 2;"]),
+  );
+
+  assert.notEqual(titles["app.py"], "Formatting-only changes");
+  assert.notEqual(titles["ci.yaml"], "Formatting-only changes");
+  assert.notEqual(titles["Makefile"], "Formatting-only changes");
+  assert.notEqual(titles["crlf.js"], "Formatting-only changes");
+  assert.equal(titles["layout.js"], "Formatting-only changes");
+});
+
+test("a require call used as code does not make a hunk import-only", () => {
+  const titles = groupTitlesFor(
+    singleHunk("server.js", [], ['import express from "express";', 'require("./plugins")(app);']) +
+      singleHunk(
+        "deps.js",
+        [],
+        ['const path = require("node:path");', 'import fs from "node:fs";'],
+      ),
+  );
+
+  assert.notEqual(titles["server.js"], "Imports and includes");
+  assert.equal(titles["deps.js"], "Imports and includes");
+});
+
+test("change rows treat header-like deleted and added content as lines", () => {
+  const fixture = fs.readFileSync(
+    path.join(root, "test", "fixtures", "tricky-paths.patch"),
+    "utf8",
+  );
+  const changes = parsePatchChanges(fixture, analyzePatch(fixture));
+
+  assert.deepEqual(
+    changes.map((change) => [change.file, change.oldFile, change.rows]),
+    [
+      ["query.sql", "query.sql", ["query.sql#h0:d2", "query.sql#h0:a2"]],
+      ["café.txt", "café.txt", ["café.txt#h0:d1", "café.txt#h0:a1"]],
+      ["z b/w.txt", "x b/y.txt", ["z b/w.txt#h0:d1", "z b/w.txt#h0:a1"]],
+    ],
+  );
+  assert.deepEqual(changes[0].deleted, ["-- comment"]);
+  assert.deepEqual(changes[0].added, ["++ b;"]);
+});

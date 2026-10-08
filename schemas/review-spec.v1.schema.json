@@ -70,7 +70,7 @@
       "properties": {
         "repository": {
           "type": "string",
-          "pattern": "^[^/\\\\s]+/[^/\\\\s]+$"
+          "pattern": "^[\\w.-]+/[\\w.-]+$"
         },
         "pullRequest": { "type": "integer", "minimum": 1 },
         "headSha": { "type": "string", "minLength": 1 }
