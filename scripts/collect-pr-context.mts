@@ -22,7 +22,8 @@ function usage(message?: string): never {
   console.error(`Usage:
   node collect-pr-context.mjs [--repo <path>] [--pr auto|none|<number|url>]
     [--base <ref>] [--out <context.json>] [--diff-out <context.patch>]
-    [--files-out <context.files.json>] [--git-diff] [--revision <ref>]
+    [--files-out <context.files.json>] [--git-diff] [--revision <ref>] [--cached]
+    [-- <pathspec>...]
 
 Options:
   --pr auto        Detect the current branch's pull request; fall back locally (default).
@@ -31,7 +32,9 @@ Options:
   --no-remote      Alias for --pr none.
   --base <ref>     Local diff base; the diff starts at its merge-base with HEAD
                    (default: origin's default branch, or HEAD).
-  --git-diff       Use exact git-diff revision semantics; repeat --revision for refs.`);
+  --git-diff       Use exact git-diff revision semantics; repeat --revision for refs.
+  --cached         With --git-diff, compare staged changes (git diff --cached).
+  -- <pathspec>    Limit a local diff to these Git pathspecs.`);
   process.exit(message ? 1 : 0);
 }
 
@@ -49,6 +52,10 @@ function parseArgs(argv: readonly string[]): Args {
     else if (arg === "--revision") {
       args.revisions ??= [];
       args.revisions.push(requiredValue(argv, index++, arg, usage));
+    } else if (arg === "--cached") args.cached = true;
+    else if (arg === "--") {
+      args.pathspecs = argv.slice(index + 1);
+      break;
     } else if (arg === "--no-remote") args.pr = "none";
     else if (arg === "--help" || arg === "-h") args.help = true;
     else usage(`Unknown option: ${arg}`);

@@ -45,7 +45,10 @@ try {
   const resultPath = path.resolve(args.result);
   const input = parseJson(fs.readFileSync(inputPath, "utf8")) as AnalysisInput;
   const result = parseJson(fs.readFileSync(resultPath, "utf8")) as AnalysisResult;
-  const review = analysisResultToReview(result, input);
+  const patchPath = input.diff?.path ? path.resolve(path.dirname(inputPath), input.diff.path) : "";
+  const patch =
+    patchPath && fs.existsSync(patchPath) ? fs.readFileSync(patchPath, "utf8") : undefined;
+  const review = analysisResultToReview(result, input, { patch });
   const outputPath = path.resolve(args.out || path.join(path.dirname(resultPath), "review.json"));
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
   fs.writeFileSync(outputPath, `${JSON.stringify(review, null, 2)}\n`, "utf8");

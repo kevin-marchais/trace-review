@@ -1,4 +1,5 @@
 import { validateGrouping } from "./change-groups.mjs";
+import { DiagnosticError, type Diagnostic } from "./diagnostics.mjs";
 import type {
   ChangeGroup,
   ChangeGroupKind,
@@ -273,16 +274,58 @@ export function validateLmGroupingResult(
   return { valid: diagnostics.length === 0, diagnostics };
 }
 
+const GROUPING_HINTS: Readonly<Record<string, string>> = {
+  "missing-groups": "Return at least one group.",
+  "missing-group-title": "Name the decision the changes make.",
+  "generic-group-title": "Name the concrete decision, such as 'Reject empty session tokens'.",
+  "duplicate-group-title": "Give every group a distinct title.",
+  "incomplete-group-rationale":
+    "Fill intent, risk (low/medium/high), confidence (0-1), evidence, and reviewerChecks.",
+  "missing-title-evidence": "Cite assigned change IDs in titleEvidence.changeIds with a rationale.",
+  "unassigned-title-evidence": "Cite only change IDs that belong to this group.",
+  "missing-change-ids": "List candidate group IDs in from, or change IDs in changeIds.",
+  "mixed-repeated-pattern": "Keep each repeated-pattern candidate group in a group of its own.",
+  "split-repeated-pattern": "Reference the whole repeated-pattern candidate group from one group.",
+  "unknown-change": "Copy change IDs exactly from the candidate list.",
+  "overlapping-change": "Assign each change to exactly one group.",
+  "unclassified-change": "Add the change, or its candidate group in from, to one group.",
+  "unknown-prerequisite": "readAfter must list exact titles of other groups in this result.",
+};
+
+/** Convert grouping diagnostics to path-addressed diagnostics with corrective hints. */
+export function groupingPathDiagnostics(
+  diagnostics: readonly GroupingDiagnostic[],
+  groups: ReadonlyArray<{ title?: unknown }>,
+): Diagnostic[] {
+  const indexOf = (label: string | undefined): number => {
+    if (!label) return -1;
+    const byTitle = groups.findIndex((group) => String(group?.title || "").trim() === label);
+    if (byTitle >= 0) return byTitle;
+    const numbered = /^group (\d+)$/.exec(label);
+    return numbered ? Number(numbered[1]) - 1 : -1;
+  };
+  return diagnostics.map((diagnostic) => {
+    const index = indexOf(diagnostic.group ?? diagnostic.groups?.[diagnostic.groups.length - 1]);
+    const hint = GROUPING_HINTS[diagnostic.code];
+    return {
+      code: diagnostic.code,
+      path: index >= 0 ? `groups[${index}]` : "groups",
+      message: diagnostic.message,
+      ...(hint ? { hint } : {}),
+    };
+  });
+}
+
 export function finalizeLmGrouping(
   result: LmGroupingResult,
   candidates: ChangeGrouping,
 ): FinalizedLmGrouping {
   const semanticValidation = validateLmGroupingResult(result, candidates);
   if (!semanticValidation.valid) {
-    const details = semanticValidation.diagnostics
-      .map((diagnostic) => `${diagnostic.code}: ${diagnostic.message}`)
-      .join("; ");
-    throw new Error(`Invalid LM grouping result: ${details}`);
+    throw new DiagnosticError(
+      "Invalid LM grouping result:",
+      groupingPathDiagnostics(semanticValidation.diagnostics, result.groups || []),
+    );
   }
 
   const changes = candidateChanges(candidates);
