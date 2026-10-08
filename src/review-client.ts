@@ -11,6 +11,9 @@ import {
   ReviewServerClient,
   SCROLL_STORAGE_KEY,
   StateSyncer,
+  UNSAVED_STORAGE_KEY,
+  isStaleReview,
+  mergeReviewStates,
   readServeToken,
   type ReviewStateRecord,
   type ServerSession,
@@ -276,7 +279,9 @@ void (async function () {
   const serveToken = readServeToken(window.location, safeSessionStorage(), (url) =>
     history.replaceState(null, "", url),
   );
-  let server: ReviewServerClient | null = serveToken ? new ReviewServerClient(serveToken) : null;
+  let server: ReviewServerClient | null = serveToken
+    ? new ReviewServerClient(serveToken, REVIEW_ID)
+    : null;
   let session: ServerSession | null = null;
   let diskState: { revision: number; state: ReviewStateRecord } | null = null;
   if (server) {
@@ -296,8 +301,30 @@ void (async function () {
     const raw = localStorage.getItem(STORE_KEY);
     if (raw) localState = JSON.parse(raw);
   } catch (e) {}
+  // Edits an older build of this page could not save (the review was rebuilt
+  // under a new ID meanwhile) are merged into the migrated state.
+  let restoredUnsaved: ReviewStateRecord | null = null;
+  if (diskState) {
+    try {
+      const raw = safeSessionStorage()?.getItem(UNSAVED_STORAGE_KEY);
+      const unsaved = raw
+        ? (JSON.parse(raw) as {
+            from?: string;
+            at?: number;
+            base?: ReviewStateRecord;
+            local?: ReviewStateRecord;
+          })
+        : null;
+      if (unsaved && Date.now() - (unsaved.at || 0) > 10 * 60_000) {
+        safeSessionStorage()?.removeItem(UNSAVED_STORAGE_KEY);
+      } else if (unsaved && unsaved.from !== REVIEW_ID && unsaved.base && unsaved.local) {
+        safeSessionStorage()?.removeItem(UNSAVED_STORAGE_KEY);
+        restoredUnsaved = mergeReviewStates(diskState.state, unsaved.base, unsaved.local).merged;
+      }
+    } catch {}
+  }
   const state = normalizeStoredState(
-    diskState ? diskState.state : localState,
+    restoredUnsaved ?? (diskState ? diskState.state : localState),
   ) as unknown as ReviewState;
   state.version = STATE_VERSION;
   const STATE_MAPS = [
@@ -372,6 +399,15 @@ void (async function () {
     } catch {}
     window.location.reload();
   }
+  // The server says this page is an older build: reload into the new one.
+  let reloadingStale = false;
+  function reloadStale(): void {
+    if (reloadingStale) return;
+    reloadingStale = true;
+    showServeStatus("The review was rebuilt; reloading with your comments…");
+    void reloadPreservingScroll();
+  }
+  if (server) server.onStale = reloadStale;
   const syncer =
     server && diskState
       ? new StateSyncer(server, diskState.revision, diskState.state, {
@@ -382,6 +418,17 @@ void (async function () {
             STATE_MAPS.forEach((key) => Object.assign(state, { [key]: next[key] }));
           },
           remoteChanged: () => void reloadPreservingScroll(),
+          stale(base, local) {
+            if (JSON.stringify(base) !== JSON.stringify(local)) {
+              try {
+                safeSessionStorage()?.setItem(
+                  UNSAVED_STORAGE_KEY,
+                  JSON.stringify({ from: REVIEW_ID, at: Date.now(), base, local }),
+                );
+              } catch {}
+            }
+            reloadStale();
+          },
           status(kind, message) {
             if (serveBadge) {
               serveBadge.textContent =
@@ -4127,6 +4174,8 @@ void (async function () {
       void (async () => {
         await syncer.flush();
         const result = await client.clearState(syncer.revision).catch(() => null);
+        // An older build of the page reloads itself (onStale) instead.
+        if (result && isStaleReview(result.status, result.data)) return;
         if (!result || result.status !== 200) {
           window.alert("The review could not be cleared on the review server. Try again.");
           return;
@@ -4725,7 +4774,7 @@ void (async function () {
       requestAnimationFrame(() => window.scrollTo(0, y));
       setTimeout(() => window.scrollTo(0, y), 400);
     }
-    if (importedLocalState) save();
+    if (importedLocalState || restoredUnsaved) save();
   }
 
   // ---- init ----

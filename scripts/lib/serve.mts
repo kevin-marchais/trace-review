@@ -21,7 +21,7 @@ import {
   type GithubPublisher,
   type GithubReviewEvent,
 } from "./github-review.mjs";
-import { createGhPublisher } from "./github-publisher.mjs";
+import { asyncGhRunner, createGhPublisher } from "./github-publisher.mjs";
 import {
   attachmentContentType,
   feedbackReport,
@@ -34,6 +34,7 @@ export const TOKEN_HEADER = "x-trace-review-token";
 export const REVIEW_HEADER = "x-trace-review-id";
 export const CLIENT_HEADER = "x-trace-review-client";
 const MAX_BODY_BYTES = 12 * 1024 * 1024;
+const DRAIN_LIMIT_BYTES = 64 * 1024 * 1024;
 const LOOPBACK_HOSTS = new Map([
   ["127.0.0.1", "127.0.0.1"],
   ["localhost", "127.0.0.1"],
@@ -48,6 +49,8 @@ export interface RebuildOutcome {
 
 export interface WatchOptions {
   files: string[];
+  /** Watched files the rebuild rewrites itself; their changes do not trigger a rebuild. */
+  outputs?: string[];
   rebuild(changed: string[]): Promise<RebuildOutcome>;
   pollMs?: number;
   debounceMs?: number;
@@ -107,31 +110,57 @@ function sameToken(expected: string, actual: string | string[] | undefined): boo
   return left.length === right.length && timingSafeEqual(left, right);
 }
 
-function sendJson(response: http.ServerResponse, status: number, body: unknown): void {
+function sendJson(
+  response: http.ServerResponse,
+  status: number,
+  body: unknown,
+  extraHeaders: http.OutgoingHttpHeaders = {},
+): void {
   const text = JSON.stringify(body);
   response.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": Buffer.byteLength(text),
     "Cache-Control": "no-store",
     "X-Content-Type-Options": "nosniff",
+    ...extraHeaders,
   });
   response.end(text);
 }
 
+const tooLarge = (): HttpError =>
+  new HttpError(413, "The request body is too large.", { code: "too-large" });
+
+// An oversized body is answered with 413 and `Connection: close` (see the
+// request handler) once the client has finished sending it: the excess is
+// read and discarded, because closing the socket while the client is still
+// uploading resets the connection and the client never sees the answer.
+// Beyond DRAIN_LIMIT_BYTES (or a declared length above it) the answer is sent
+// at once.
 function readJsonBody(request: http.IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
+    if (Number(request.headers["content-length"]) > DRAIN_LIMIT_BYTES) {
+      reject(tooLarge());
+      return;
+    }
     const chunks: Buffer[] = [];
     let size = 0;
-    request.on("data", (chunk: Buffer) => {
+    const onData = (chunk: Buffer): void => {
       size += chunk.length;
+      if (size > DRAIN_LIMIT_BYTES) {
+        request.off("data", onData);
+        reject(tooLarge());
+      } else if (size > MAX_BODY_BYTES) {
+        chunks.length = 0;
+      } else {
+        chunks.push(chunk);
+      }
+    };
+    request.on("data", onData);
+    request.on("end", () => {
       if (size > MAX_BODY_BYTES) {
-        reject(new HttpError(413, "The request body is too large."));
-        request.destroy();
+        reject(tooLarge());
         return;
       }
-      chunks.push(chunk);
-    });
-    request.on("end", () => {
       try {
         resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "null") as unknown);
       } catch {
@@ -198,10 +227,15 @@ export class FileWatcher {
     }
   }
 
-  /** Accept the current content of every file as seen (after our own rebuild). */
-  refresh(): void {
-    this.pending.clear();
-    for (const file of this.files) {
+  /**
+   * Accept the current content of `files` as seen (the rebuild's own outputs).
+   * Every other file keeps its last reported hash, so a write that landed
+   * during a rebuild is still reported once it settles.
+   */
+  refresh(files: readonly string[] = this.files): void {
+    for (const file of files) {
+      if (!this.files.includes(file)) continue;
+      this.pending.delete(file);
       this.signatures.set(file, this.signature(file));
       this.hashes.set(file, this.hash(file));
     }
@@ -245,6 +279,37 @@ const WAITING_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8"
 <script>(function(){var k="trace-review:serve-token",m=/(?:^#|&)token=([^&]+)/.exec(location.hash);if(m){sessionStorage.setItem(k,decodeURIComponent(m[1]));history.replaceState(null,"",location.pathname)}var t=sessionStorage.getItem(k);if(!t){document.getElementById("status").textContent="Open the URL printed in the terminal.";return}
 function listen(){fetch("/api/events",{headers:{"x-trace-review-token":t}}).then(function(r){var d=r.body.getReader(),x=new TextDecoder(),b="";function read(){return d.read().then(function(s){if(s.done)throw 0;b+=x.decode(s.value,{stream:true});if(/event: reload/.test(b))location.reload();var e=/event: rebuild-error\\ndata: (.*)/.exec(b);if(e){try{document.getElementById("status").textContent=JSON.parse(e[1]).message}catch(_){}b=""}return read()})}return read()}).catch(function(){setTimeout(listen,1500)})}listen()})();</script></body></html>`;
 
+// The only external scripts a review page loads: highlight.js (pinned, with
+// subresource integrity) and, for diagrams, the Mermaid ES module and its chunks.
+const PAGE_SCRIPT_SOURCES = [
+  "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/",
+  "https://cdn.jsdelivr.net/npm/mermaid@11/",
+];
+
+/**
+ * The served page's Content-Security-Policy: scripts run only from the two
+ * CDN paths above or as the page's own inline scripts, allowed by hash. The
+ * page holds the API token, so nothing else may execute in its origin.
+ */
+export function pageContentSecurityPolicy(html: string): string {
+  const hashes = new Set<string>();
+  for (const match of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)) {
+    const attributes = match[1];
+    if (/\ssrc\s*=/i.test(attributes)) continue;
+    const type = /\stype\s*=\s*["']?([^"'\s>]+)/i.exec(attributes)?.[1]?.toLowerCase();
+    if (type && type !== "module" && !/(?:java|ecma)script/.test(type)) continue;
+    // Browsers hash the script text after normalizing line breaks to LF.
+    const source = match[2].replace(/\r\n?/g, "\n");
+    hashes.add(`'sha256-${createHash("sha256").update(source, "utf8").digest("base64")}'`);
+  }
+  return [
+    ["script-src", "'self'", ...hashes, ...PAGE_SCRIPT_SOURCES].join(" "),
+    "object-src 'none'",
+    "base-uri 'none'",
+    "frame-ancestors 'none'",
+  ].join("; ");
+}
+
 /** Open a URL with the platform handler, without a shell. */
 export function openUrlInBrowser(url: string): void {
   const [command, args] =
@@ -264,7 +329,7 @@ export async function startReviewServer(options: ReviewServerOptions): Promise<R
   const bindAddress = loopbackBindAddress(options.host ?? "127.0.0.1");
   const token = options.token ?? randomBytes(32).toString("base64url");
   const store = new ReviewStateStore(path.join(options.reviewDir, "state"));
-  const publisher = options.publisher ?? createGhPublisher();
+  const publisher = options.publisher ?? createGhPublisher(asyncGhRunner({ timeoutMs: 120_000 }));
   const log = options.log ?? (() => {});
   let htmlPath = options.htmlPath;
   let currentReviewId = readSpec(options.specPath).reviewId;
@@ -278,8 +343,11 @@ export async function startReviewServer(options: ReviewServerOptions): Promise<R
     for (const client of clients) client.write(frame);
   };
 
+  // State belongs to the review the served page was built from. spec.json may
+  // already name the next review while its rebuild runs; the switch (and the
+  // migration of the comments) happens only once that rebuild has finished.
   const requireReview = (request: http.IncomingMessage): string => {
-    const reviewId = readSpec(options.specPath).reviewId ?? currentReviewId;
+    const reviewId = currentReviewId ?? readSpec(options.specPath).reviewId;
     if (!reviewId) throw new HttpError(409, "The review has not been built yet.");
     const asked = request.headers[REVIEW_HEADER];
     if (typeof asked === "string" && asked && asked !== reviewId) {
@@ -298,7 +366,7 @@ export async function startReviewServer(options: ReviewServerOptions): Promise<R
   ): Promise<void> {
     const route = `${request.method} ${url.pathname}`;
     if (route === "GET /api/session") {
-      const reviewId = readSpec(options.specPath).reviewId ?? currentReviewId;
+      const reviewId = currentReviewId ?? readSpec(options.specPath).reviewId;
       const document = reviewId ? store.read(reviewId) : null;
       const files = reviewId ? store.files(reviewId) : null;
       sendJson(response, 200, {
@@ -398,7 +466,12 @@ export async function startReviewServer(options: ReviewServerOptions): Promise<R
     }
     if (request.method === "GET" && url.pathname.startsWith("/api/attachments/")) {
       const reviewId = requireReview(request);
-      const file = decodeURIComponent(url.pathname.slice("/api/attachments/".length));
+      let file: string;
+      try {
+        file = decodeURIComponent(url.pathname.slice("/api/attachments/".length));
+      } catch {
+        throw new HttpError(404, "No such attachment.");
+      }
       const target = store.attachmentFile(reviewId, file);
       const type = attachmentContentType(file);
       if (!target || !type) throw new HttpError(404, "No such attachment.");
@@ -505,7 +578,7 @@ export async function startReviewServer(options: ReviewServerOptions): Promise<R
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",
       "X-Frame-Options": "DENY",
-      "Content-Security-Policy": "frame-ancestors 'none'",
+      "Content-Security-Policy": pageContentSecurityPolicy(html),
       "Referrer-Policy": "no-referrer",
     });
     response.end(html);
@@ -546,7 +619,13 @@ export async function startReviewServer(options: ReviewServerOptions): Promise<R
           return;
         }
         if (error instanceof HttpError) {
-          sendJson(response, error.status, { error: error.message, ...error.body });
+          // A 413 closes the connection rather than read further requests after it.
+          sendJson(
+            response,
+            error.status,
+            { error: error.message, ...error.body },
+            error.status === 413 ? { Connection: "close" } : {},
+          );
         } else {
           log(`Server error: ${error instanceof Error ? error.message : String(error)}`);
           sendJson(response, 500, { error: "Internal server error." });
@@ -574,11 +653,13 @@ export async function startReviewServer(options: ReviewServerOptions): Promise<R
   let watcher: FileWatcher | undefined;
   if (options.watch) {
     const watch = options.watch;
+    const outputs = new Set(watch.outputs ?? []);
     let running = false;
     let queued: string[] = [];
     const rebuild = async (changed: string[]): Promise<void> => {
       if (running) {
-        queued.push(...changed);
+        // The rebuild rewriting its own outputs is not a new change.
+        queued.push(...changed.filter((file) => !outputs.has(file)));
         return;
       }
       running = true;
@@ -599,7 +680,7 @@ export async function startReviewServer(options: ReviewServerOptions): Promise<R
         broadcast("rebuild-error", { message });
         log(`Rebuild failed: ${message}`);
       } finally {
-        watcher?.refresh();
+        watcher?.refresh([...outputs]);
         running = false;
         if (queued.length) {
           const next = [...new Set(queued)];

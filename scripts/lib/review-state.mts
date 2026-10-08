@@ -203,7 +203,9 @@ export class ReviewStateStore {
     };
     const files = this.files(reviewId);
     atomicWriteFile(files.state, `${JSON.stringify(document, null, 2)}\n`);
+    // Malformed or oversized feedback is dropped; never leave the old file behind.
     if (feedback) atomicWriteFile(files.feedback, feedbackMarkdown(document));
+    else fs.rmSync(files.feedback, { force: true });
     return { ok: true, document };
   }
 
@@ -238,17 +240,40 @@ export class ReviewStateStore {
     return fs.existsSync(target) ? target : null;
   }
 
-  /** Seed a new review ID with another review's state (after a rebuild changed the ID). */
+  /**
+   * Carry another review's state into a new review ID (after a rebuild changed
+   * the ID). A target that already has state keeps it: the maps are united and
+   * the target's entry wins where both have one.
+   */
   migrate(fromId: string, toId: string): boolean {
     if (fromId === toId) return false;
     const source = this.read(fromId);
+    if (!source.revision || isStateEmpty(source.state)) return false;
     const target = this.read(toId);
-    if (!source.revision || isStateEmpty(source.state) || target.revision) return false;
     const from = this.files(fromId).attachments;
     if (fs.existsSync(from)) {
-      fs.cpSync(from, this.files(toId).attachments, { recursive: true });
+      fs.cpSync(from, this.files(toId).attachments, { recursive: true, force: false });
     }
-    return this.write(toId, { baseRevision: 0, state: source.state, feedback: source.feedback }).ok;
+    if (isStateEmpty(target.state)) {
+      return this.write(toId, {
+        baseRevision: target.revision,
+        state: source.state,
+        feedback: source.feedback,
+      }).ok;
+    }
+    const state: Record<string, unknown> = { ...source.state, ...target.state };
+    for (const key of STATE_MAPS) {
+      const left = source.state[key];
+      const right = target.state[key];
+      if (isRecord(left) || isRecord(right)) {
+        state[key] = { ...(isRecord(left) ? left : {}), ...(isRecord(right) ? right : {}) };
+      }
+    }
+    return this.write(toId, {
+      baseRevision: target.revision,
+      state,
+      feedback: target.feedback ?? source.feedback,
+    }).ok;
   }
 }
 

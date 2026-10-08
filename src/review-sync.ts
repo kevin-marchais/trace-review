@@ -6,8 +6,10 @@
 
 export const TOKEN_STORAGE_KEY = "trace-review:serve-token";
 export const SCROLL_STORAGE_KEY = "trace-review:serve-scroll";
+export const UNSAVED_STORAGE_KEY = "trace-review:serve-unsaved";
 const TOKEN_HEADER = "x-trace-review-token";
 const CLIENT_HEADER = "x-trace-review-client";
+const REVIEW_HEADER = "x-trace-review-id";
 
 export type ReviewStateRecord = Record<string, unknown>;
 
@@ -142,12 +144,23 @@ export function mergeReviewStates(
   return { merged, remoteChanged };
 }
 
+/** The server answered that this page shows an older build of the review. */
+export const isStaleReview = (status: number, data: unknown): boolean =>
+  status === 409 && isRecord(data) && data.code === "stale-review";
+
 export class ReviewServerClient {
   readonly clientId = Math.random().toString(36).slice(2) + Date.now().toString(36);
   private readonly attachmentUrls = new Map<string, string>();
+  /** Called when the server says the page is an older build (it should reload). */
+  onStale: (() => void) | null = null;
 
+  /**
+   * `reviewId` is the review this page was built for; every call names it so
+   * the server never applies this page's state to a newer review.
+   */
   constructor(
     readonly token: string,
+    readonly reviewId: string | null = null,
     private readonly fetcher: (input: string, init?: RequestInit) => Promise<Response> = (
       input,
       init,
@@ -158,6 +171,7 @@ export class ReviewServerClient {
     return {
       [TOKEN_HEADER]: this.token,
       [CLIENT_HEADER]: this.clientId,
+      ...(this.reviewId ? { [REVIEW_HEADER]: this.reviewId } : {}),
       ...(json ? { "Content-Type": "application/json" } : {}),
     };
   }
@@ -180,6 +194,7 @@ export class ReviewServerClient {
     try {
       data = await response.json();
     } catch {}
+    if (isStaleReview(response.status, data)) this.onStale?.();
     return { status: response.status, data: data as T };
   }
 
@@ -239,6 +254,10 @@ export class ReviewServerClient {
       cache: "no-store",
       credentials: "omit",
     });
+    if (response.status === 409) {
+      const data: unknown = await response.json().catch(() => null);
+      if (isStaleReview(response.status, data)) this.onStale?.();
+    }
     if (!response.ok) return "";
     const url = URL.createObjectURL(await response.blob());
     this.attachmentUrls.set(file, url);
@@ -307,6 +326,11 @@ export interface SyncCallbacks {
   replace(state: ReviewStateRecord): void;
   /** Another writer changed entries this page does not show yet. */
   remoteChanged(): void;
+  /**
+   * The page is an older build of the review: nothing more is sent. `base` and
+   * `local` are the last synced and the unsaved state, to carry over a reload.
+   */
+  stale(base: ReviewStateRecord, local: ReviewStateRecord): void;
   status(kind: "saving" | "saved" | "error", message?: string): void;
 }
 
@@ -318,6 +342,7 @@ export class StateSyncer {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private inFlight = false;
   private again = false;
+  private stopped = false;
   private base: ReviewStateRecord;
 
   constructor(
@@ -326,6 +351,7 @@ export class StateSyncer {
     initial: ReviewStateRecord,
     private readonly callbacks: SyncCallbacks,
     private readonly delayMs = 300,
+    private readonly retryMs = 3000,
   ) {
     this.base = JSON.parse(JSON.stringify(initial)) as ReviewStateRecord;
   }
@@ -335,6 +361,7 @@ export class StateSyncer {
   }
 
   schedule(): void {
+    if (this.stopped) return;
     if (this.timer !== undefined) clearTimeout(this.timer);
     this.callbacks.status("saving");
     this.timer = setTimeout(() => {
@@ -355,7 +382,7 @@ export class StateSyncer {
 
   /** Best effort on page hide: a keepalive request that outlives the page. */
   flushOnUnload(): void {
-    if (this.timer === undefined) return;
+    if (this.stopped || this.timer === undefined) return;
     clearTimeout(this.timer);
     this.timer = undefined;
     void this.client
@@ -370,6 +397,7 @@ export class StateSyncer {
   }
 
   private async send(): Promise<void> {
+    if (this.stopped) return;
     if (this.inFlight) {
       this.again = true;
       return;
@@ -377,7 +405,8 @@ export class StateSyncer {
     this.inFlight = true;
     let remoteChanged = false;
     try {
-      for (let attempt = 0; attempt < 5; attempt++) {
+      let done = false;
+      for (let attempt = 0; attempt < 5 && !done; attempt++) {
         const snapshot = this.callbacks.snapshot();
         const { status, data } = await this.client.saveState(
           this.revision,
@@ -388,7 +417,24 @@ export class StateSyncer {
           this.revision = Number(data.revision);
           this.base = JSON.parse(JSON.stringify(snapshot)) as ReviewStateRecord;
           this.callbacks.status("saved");
-          break;
+          done = true;
+          continue;
+        }
+        if (isStaleReview(status, data)) {
+          // Never merge into another review's state: hand over and stop.
+          this.stopped = true;
+          this.again = false;
+          this.callbacks.stale(this.base, snapshot);
+          return;
+        }
+        if (status === 413) {
+          // Retrying cannot shrink the request; the next edit tries again.
+          this.callbacks.status(
+            "error",
+            "Comments could not be saved: they are larger than the review server accepts. Remove some images or long comments.",
+          );
+          done = true;
+          continue;
         }
         if (status === 409 && isRecord(data.state)) {
           const merged = mergeReviewStates(data.state, this.base, snapshot);
@@ -400,6 +446,7 @@ export class StateSyncer {
         }
         throw new Error(String(data?.error || `The review server answered ${status}.`));
       }
+      if (!done) throw new Error("other writers kept changing the comments; retrying.");
     } catch (error) {
       this.callbacks.status(
         "error",
@@ -409,7 +456,7 @@ export class StateSyncer {
       this.timer = setTimeout(() => {
         this.timer = undefined;
         void this.send();
-      }, 3000);
+      }, this.retryMs);
     } finally {
       this.inFlight = false;
     }

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -7,7 +8,11 @@ import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { parseCliArgs, UsageError } from "../scripts/lib/cli-args.mjs";
-import { createGhPublisher, type GhResult } from "../scripts/lib/github-publisher.mjs";
+import {
+  asyncGhRunner,
+  createGhPublisher,
+  type GhResult,
+} from "../scripts/lib/github-publisher.mjs";
 import { ReviewStateStore, stateFileStem } from "../scripts/lib/review-state.mjs";
 import {
   AskRunner,
@@ -21,7 +26,15 @@ import {
   type ReviewServer,
   type ReviewServerOptions,
 } from "../scripts/lib/serve.mjs";
-import { mergeReviewStates, parseServerSentEvents, readServeToken } from "../src/review-sync.js";
+import {
+  mergeReviewStates,
+  parseServerSentEvents,
+  readServeToken,
+  ReviewServerClient,
+  StateSyncer,
+  type ReviewStateRecord,
+  type SyncCallbacks,
+} from "../src/review-sync.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cli = path.join(root, "dist", "runtime", "scripts", "trace-review.mjs");
@@ -623,4 +636,384 @@ test("serve and feedback parse like the review command", () => {
   assert.throws(() => parseCliArgs(["feedback", "abc", "--latest"], "/repo"), UsageError);
   assert.throws(() => parseCliArgs(["serve", "--port", "70000"], "/repo"), UsageError);
   assert.throws(() => parseCliArgs(["finish", "--serve"], "/repo"), UsageError);
+});
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitFor(condition: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error("timed out waiting");
+    await sleep(20);
+  }
+}
+
+test("comments saved while a rebuild switches the review ID are carried over", async (t) => {
+  const dir = reviewDirectory(t);
+  const spec = path.join(dir, "spec.json");
+  let release = (): void => {};
+  const released = new Promise<void>((resolve) => (release = resolve));
+  let rebuilding = false;
+  const server = await serve(t, dir, {
+    watch: {
+      files: [spec],
+      outputs: [spec],
+      pollMs: 25,
+      debounceMs: 50,
+      async rebuild() {
+        rebuilding = true;
+        await released;
+        return {};
+      },
+    },
+  });
+  const asPage = { "x-trace-review-id": REVIEW_ID };
+  const earlier = { general: { "pr-42": "Earlier comment." } };
+  const first = await call(server, {
+    method: "PUT",
+    path: "/api/state",
+    headers: asPage,
+    body: { baseRevision: 0, state: earlier },
+  });
+  assert.equal(first.status, 200, first.text);
+
+  const nextId = "acme-widgets-pr-42-def456";
+  const specJson = JSON.parse(fs.readFileSync(spec, "utf8")) as Record<string, unknown>;
+  fs.writeFileSync(spec, JSON.stringify({ ...specJson, reviewId: nextId }));
+  await waitFor(() => rebuilding);
+
+  // spec.json already names the next review, but the page still shows (and
+  // saves to) the review it was built from until the rebuild finishes.
+  const edited = { ...earlier, lines: { a: { text: "New edit." } } };
+  const during = await call(server, {
+    method: "PUT",
+    path: "/api/state",
+    headers: asPage,
+    body: { baseRevision: 1, state: edited },
+  });
+  assert.equal(during.status, 200, during.text);
+  assert.equal(during.json.revision, 2);
+
+  const reload = nextEvent(server, "reload");
+  await sleep(150);
+  release();
+  assert.deepEqual(await reload, { reviewId: nextId });
+  const asNext = { "x-trace-review-id": nextId };
+  assert.deepEqual(
+    (await call(server, { path: "/api/state", headers: asNext })).json.state,
+    edited,
+  );
+
+  // A page still showing the old build is told to reload, never merged.
+  const stale = await call(server, {
+    method: "PUT",
+    path: "/api/state",
+    headers: asPage,
+    body: { baseRevision: 2, state: {} },
+  });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.json.code, "stale-review");
+  assert.equal(stale.json.reviewId, nextId);
+  assert.deepEqual(
+    (await call(server, { path: "/api/state", headers: asNext })).json.state,
+    edited,
+  );
+});
+
+test("migrating into a review that already has state unites both", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "trace-review-migrate-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = new ReviewStateStore(path.join(dir, "state"));
+  store.write("old", {
+    baseRevision: 0,
+    state: { general: { x: "old x", y: "old y" }, lines: { l1: { text: "line" } } },
+  });
+  store.write("new", { baseRevision: 0, state: { general: { y: "new y" } } });
+  assert.equal(store.migrate("old", "new"), true);
+  const merged = store.read("new");
+  assert.equal(merged.revision, 2);
+  assert.deepEqual(merged.state, {
+    general: { x: "old x", y: "new y" },
+    lines: { l1: { text: "line" } },
+  });
+
+  // A cleared target (revision > 0, no entries) still receives the comments.
+  store.clear("new", 2);
+  assert.equal(store.migrate("old", "new"), true);
+  assert.deepEqual(store.read("new").state, store.read("old").state);
+  assert.equal(store.migrate("empty", "new"), false);
+});
+
+test("a result written while a rebuild runs triggers another rebuild", async (t) => {
+  const dir = reviewDirectory(t);
+  const result = path.join(dir, "lm", "result.json");
+  const spec = path.join(dir, "spec.json");
+  fs.mkdirSync(path.dirname(result), { recursive: true });
+  fs.writeFileSync(result, '{"summary":"first"}');
+  const rebuilt: string[][] = [];
+  await serve(t, dir, {
+    watch: {
+      files: [result, spec],
+      outputs: [spec],
+      pollMs: 25,
+      debounceMs: 50,
+      async rebuild(changed) {
+        rebuilt.push(changed.map((file) => path.basename(file)));
+        if (rebuilt.length === 1) {
+          // The rebuild rewrites spec.json itself; the agent writes a newer result meanwhile.
+          fs.appendFileSync(spec, "\n");
+          fs.writeFileSync(result, '{"summary":"third"}');
+        }
+        return {};
+      },
+    },
+  });
+  await sleep(150);
+  fs.writeFileSync(result, '{"summary":"second"}');
+  await waitFor(() => rebuilt.length >= 2);
+  await sleep(300);
+  assert.deepEqual(rebuilt, [["result.json"], ["result.json"]]);
+});
+
+test(
+  "an oversized body is answered with 413 and the connection closed",
+  { timeout: 30_000 },
+  async (t) => {
+    const server = await serve(t, reviewDirectory(t));
+    const streamed = await call(server, {
+      method: "PUT",
+      path: "/api/state",
+      body: "x".repeat(12 * 1024 * 1024 + 1),
+    });
+    assert.equal(streamed.status, 413);
+    assert.equal(streamed.headers.connection, "close");
+    assert.equal(streamed.json.code, "too-large");
+    assert.equal((await call(server, { path: "/api/session" })).status, 200);
+
+    // Under Node (the runtime the server ships for), closing the socket while
+    // the client still uploads resets the connection; the client must get the 413.
+    const script = `
+    import fs from "node:fs";
+    import os from "node:os";
+    import path from "node:path";
+    import { pathToFileURL } from "node:url";
+    const { startReviewServer } = await import(pathToFileURL(process.argv[1]).href);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "trace-review-413-"));
+    fs.writeFileSync(path.join(dir, "spec.json"), JSON.stringify({ reviewId: "r" }));
+    const server = await startReviewServer({
+      reviewDir: dir, specPath: path.join(dir, "spec.json"), htmlPath: null,
+      ask: { providerName: null }, token: "t",
+    });
+    const origin = "http://127.0.0.1:" + server.port;
+    const outcome = await fetch(origin + "/api/state", {
+      method: "PUT",
+      headers: { "x-trace-review-token": "t", origin, "content-type": "application/json" },
+      body: "x".repeat(12 * 1024 * 1024 + 1),
+    }).then((response) => String(response.status), (error) => "error " + error.cause?.code);
+    console.log(outcome);
+    await server.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  `;
+    const node = await new Promise<{ status: number | null; stdout: string; stderr: string }>(
+      (resolve) => {
+        const child = spawn(
+          "node",
+          [
+            "--input-type=module",
+            "-e",
+            script,
+            path.join(root, "dist", "runtime", "scripts", "lib", "serve.mjs"),
+          ],
+          { windowsHide: true },
+        );
+        let stdout = "";
+        let stderr = "";
+        child.stdout.setEncoding("utf8").on("data", (chunk: string) => (stdout += chunk));
+        child.stderr.setEncoding("utf8").on("data", (chunk: string) => (stderr += chunk));
+        child.on("close", (status) => resolve({ status, stdout, stderr }));
+      },
+    );
+    assert.equal(node.status, 0, node.stderr);
+    assert.equal(node.stdout.trim(), "413");
+  },
+);
+
+test("a malformed escape in an attachment path is a 404, not a server error", async (t) => {
+  const server = await serve(t, reviewDirectory(t));
+  assert.equal((await call(server, { path: "/api/attachments/%E0%A4%A" })).status, 404);
+  assert.equal((await call(server, { path: "/api/attachments/%zz.png" })).status, 404);
+});
+
+test("feedback the store rejects removes the previous feedback file", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "trace-review-feedback-file-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = new ReviewStateStore(path.join(dir, "state"));
+  const state = { general: { "pr-42": "Note." } };
+  store.write(REVIEW_ID, {
+    baseRevision: 0,
+    state,
+    feedback: { markdown: "# Old feedback", items: [] },
+  });
+  const feedbackFile = store.files(REVIEW_ID).feedback;
+  assert.match(fs.readFileSync(feedbackFile, "utf8"), /Old feedback/);
+  store.write(REVIEW_ID, { baseRevision: 1, state, feedback: { markdown: 42 } });
+  assert.equal(fs.existsSync(feedbackFile), false);
+  assert.equal(store.read(REVIEW_ID).feedback, null);
+
+  store.write(REVIEW_ID, { baseRevision: 2, state, feedback: { markdown: "# Again", items: [] } });
+  assert.equal(fs.existsSync(feedbackFile), true);
+  store.write(REVIEW_ID, {
+    baseRevision: 3,
+    state,
+    feedback: { markdown: "x".repeat(4 * 1024 * 1024 + 1), items: [] },
+  });
+  assert.equal(fs.existsSync(feedbackFile), false);
+});
+
+test("the async gh runner does not block and kills gh after its timeout", async () => {
+  const echo = asyncGhRunner({
+    command: process.execPath,
+    prefixArgs: ["-e", "process.stdin.pipe(process.stdout)"],
+  });
+  assert.deepEqual(await echo(["ignored"], "hello"), { status: 0, stdout: "hello", stderr: "" });
+
+  const hang = asyncGhRunner({
+    command: process.execPath,
+    prefixArgs: ["-e", "setTimeout(() => {}, 30000)"],
+    timeoutMs: 300,
+  });
+  let ticks = 0;
+  const ticker = setInterval(() => ticks++, 20);
+  const started = Date.now();
+  const result = await hang([]);
+  clearInterval(ticker);
+  assert.match(String(result.error?.message), /did not finish within/);
+  assert.ok(Date.now() - started < 10_000);
+  assert.ok(ticks > 3, "the event loop kept running while gh ran");
+
+  const missing = await asyncGhRunner({ command: "trace-review-no-such-gh" })(["auth"]);
+  assert.ok(missing.error);
+});
+
+function fakeServer(
+  replies: Array<{ status: number; body: unknown }>,
+  seen: Array<Record<string, string>> = [],
+): ReviewServerClient {
+  return new ReviewServerClient("token", REVIEW_ID, async (_input, init) => {
+    seen.push({ ...(init?.headers as Record<string, string>) });
+    const reply = replies.length > 1 ? replies.shift() : replies[0];
+    return new Response(JSON.stringify(reply?.body ?? {}), { status: reply?.status ?? 500 });
+  });
+}
+
+function recordingCallbacks(local: ReviewStateRecord): SyncCallbacks & {
+  statuses: string[];
+  replaced: ReviewStateRecord[];
+  staleWith: Array<{ base: ReviewStateRecord; local: ReviewStateRecord }>;
+} {
+  const statuses: string[] = [];
+  const replaced: ReviewStateRecord[] = [];
+  const staleWith: Array<{ base: ReviewStateRecord; local: ReviewStateRecord }> = [];
+  return {
+    statuses,
+    replaced,
+    staleWith,
+    feedback: () => null,
+    snapshot: () => local,
+    replace: (state) => void replaced.push(state),
+    remoteChanged: () => {},
+    stale: (base, unsaved) => void staleWith.push({ base, local: unsaved }),
+    status: (kind) => void statuses.push(kind),
+  };
+}
+
+test("a page told it shows an older review stops saving instead of merging", async () => {
+  const seen: Array<Record<string, string>> = [];
+  const client = fakeServer(
+    [{ status: 409, body: { code: "stale-review", reviewId: "next-review" } }],
+    seen,
+  );
+  let staleCalls = 0;
+  client.onStale = () => staleCalls++;
+  const local = { lines: { a: { text: "unsaved" } } };
+  const callbacks = recordingCallbacks(local);
+  const syncer = new StateSyncer(client, 1, { lines: {} }, callbacks, 0, 10);
+  syncer.schedule();
+  await syncer.flush();
+  assert.equal(seen[0]["x-trace-review-id"], REVIEW_ID);
+  assert.equal(staleCalls, 1);
+  assert.deepEqual(callbacks.staleWith, [{ base: { lines: {} }, local }]);
+  assert.deepEqual(callbacks.replaced, [], "nothing is merged into the other review");
+  assert.equal(syncer.pending, false);
+  syncer.schedule();
+  await sleep(30);
+  assert.equal(seen.length, 1, "no further saves are sent");
+});
+
+test("a 413 is a permanent save error and repeated conflicts retry later", async () => {
+  const tooLarge = fakeServer([{ status: 413, body: { error: "too large" } }]);
+  const large = recordingCallbacks({ general: { a: "x" } });
+  const first = new StateSyncer(tooLarge, 0, {}, large, 0, 10);
+  first.schedule();
+  await first.flush();
+  assert.equal(large.statuses.at(-1), "error");
+  assert.equal(first.pending, false, "no retry loop after a 413");
+
+  const conflict = { status: 409, body: { code: "conflict", revision: 3, state: {} } };
+  const busy = fakeServer([
+    conflict,
+    conflict,
+    conflict,
+    conflict,
+    conflict,
+    { status: 200, body: { revision: 4 } },
+  ]);
+  const contested = recordingCallbacks({ general: { a: "x" } });
+  const second = new StateSyncer(busy, 0, {}, contested, 0, 10);
+  second.schedule();
+  await second.flush();
+  assert.equal(contested.statuses.at(-1), "error");
+  assert.equal(second.pending, true, "a retry is scheduled");
+  await waitFor(() => contested.statuses.at(-1) === "saved");
+  assert.equal(second.revision, 4);
+});
+
+test("the served page allows only its own inline scripts and the pinned CDN scripts", async (t) => {
+  const dir = reviewDirectory(t);
+  const built = spawnSync(
+    process.execPath,
+    [
+      path.join(root, "dist", "runtime", "scripts", "build-review.mjs"),
+      "--spec",
+      path.join(root, "examples", "review-spec.json"),
+      "--out",
+      path.join(dir, "review.html"),
+    ],
+    { cwd: root, encoding: "utf8" },
+  );
+  assert.equal(built.status, 0, built.stderr);
+  const server = await serve(t, dir);
+  const page = await call(server);
+  const policy = String(page.headers["content-security-policy"]);
+  const scriptSrc = /script-src ([^;]+)/.exec(policy)?.[1].split(" ") ?? [];
+  assert.doesNotMatch(policy, /unsafe-inline|unsafe-eval/);
+  assert.match(policy, /frame-ancestors 'none'/);
+  let inline = 0;
+  for (const match of page.text.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)) {
+    const src = /\ssrc="([^"]+)"/.exec(match[1])?.[1];
+    if (src) {
+      assert.match(match[1], /\sintegrity="sha384-[A-Za-z0-9+/=]+"/, src);
+      assert.match(match[1], /\scrossorigin="anonymous"/, src);
+      assert.ok(
+        scriptSrc.some((source) => source.endsWith("/") && src.startsWith(source)),
+        src,
+      );
+      continue;
+    }
+    if (/type="application\/json"/.test(match[1])) continue;
+    inline++;
+    const hash = createHash("sha256").update(match[2]).digest("base64");
+    assert.ok(scriptSrc.includes(`'sha256-${hash}'`), `inline script ${inline} is allowed`);
+  }
+  assert.ok(inline >= 3, "theme, client, and diagram scripts are hashed");
 });

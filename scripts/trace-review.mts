@@ -874,7 +874,8 @@ async function serve(args: CliArgs): Promise<void> {
       timeoutMs: Math.min(args.timeoutMs, 5 * 60 * 1000),
       ...(args.model ? { model: args.model } : {}),
     }),
-    watch: { files: [lmResult, specPath], rebuild },
+    // `finish` rewrites spec.json from the result; that is not a new change.
+    watch: { files: [lmResult, specPath], outputs: [specPath], rebuild },
     log: (message) => console.log(message),
   });
   console.log(`Serving ${input.target.title} at ${server.url}`);
