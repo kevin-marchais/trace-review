@@ -17,7 +17,7 @@ const GIT_DIFF =
 const BASE_TIP = "1111111111111111111111111111111111111111";
 const MERGE_BASE = "2222222222222222222222222222222222222222";
 const originMainBase = {
-  "git rev-parse --verify --end-of-options origin/main^{commit}": `${BASE_TIP}\n`,
+  "git rev-parse --verify origin/main^{commit}": `${BASE_TIP}\n`,
   [`git merge-base --end-of-options ${BASE_TIP} HEAD`]: `${MERGE_BASE}\n`,
 };
 
@@ -490,8 +490,8 @@ test("a pull request diff too large for GitHub is computed locally from the PR r
     ),
     [`git fetch --no-tags --quiet --end-of-options https://github.com/acme/widgets.git refs/pull/42/head ${baseSha}`]:
       "",
-    [`git rev-parse --verify --end-of-options ${baseSha}^{commit}`]: `${baseSha}\n`,
-    [`git rev-parse --verify --end-of-options ${headSha}^{commit}`]: `${headSha}\n`,
+    [`git rev-parse --verify ${baseSha}^{commit}`]: `${baseSha}\n`,
+    [`git rev-parse --verify ${headSha}^{commit}`]: `${headSha}\n`,
     [`${GIT_DIFF} ${baseSha}...${headSha}`]: patch,
   });
 

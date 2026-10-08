@@ -269,9 +269,11 @@ function gitDiff(
 
 /** Resolve a revision to a commit SHA, rejecting option-like input. */
 function verifyCommit(run: CommandRunner, root: string, revision: string): string {
+  // rejectOption blocks leading dashes; rev-parse only takes --end-of-options
+  // from Git 2.30 on, so it is left out here.
   rejectOption(revision, "Revision");
   return trim(
-    run("git", ["rev-parse", "--verify", "--end-of-options", `${revision}^{commit}`], {
+    run("git", ["rev-parse", "--verify", `${revision}^{commit}`], {
       cwd: root,
     }),
   );

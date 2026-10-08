@@ -240,7 +240,14 @@ export function extractJsonObject(text: string): unknown {
 const AUTH_RE =
   /not logged in|please run \/login|\/login|invalid api key|authenticat|unauthori[sz]ed|\b401\b|login required/i;
 
-function failure(name: string, result: SpawnResult, timeoutMs: number): ProviderError {
+// authText is the provider's own error text. Codex stdout is the whole event
+// stream, including files the model read, so it must not be matched for auth.
+function failure(
+  name: string,
+  result: SpawnResult,
+  timeoutMs: number,
+  authText = `${result.stderr}\n${result.stdout}`,
+): ProviderError {
   if (result.error?.code === "ENOENT") {
     return new ProviderError(`The ${name} CLI was not found. Install it or use --llm none.`);
   }
@@ -248,7 +255,7 @@ function failure(name: string, result: SpawnResult, timeoutMs: number): Provider
     return new ProviderError(`${name} did not finish within ${Math.round(timeoutMs / 1000)} s.`);
   }
   const detail = `${result.stderr}\n${result.stdout}`.trim().slice(-2_000);
-  if (AUTH_RE.test(detail)) {
+  if (AUTH_RE.test(authText.slice(-2_000))) {
     return new ProviderError(`${name} is not logged in or lacks credentials: ${detail}`);
   }
   return new ProviderError(
@@ -358,11 +365,8 @@ function codexProvider(dependencies: Required<ProviderDependencies>): Provider {
         text = fs.readFileSync(request.outputPath, "utf8");
       } catch {}
       if (result.status !== 0 || (!text.trim() && streamError)) {
-        throw failure(
-          "codex",
-          { ...result, stderr: `${streamError}\n${result.stderr}` },
-          request.timeoutMs,
-        );
+        const stderr = `${streamError}\n${result.stderr}`;
+        throw failure("codex", { ...result, stderr }, request.timeoutMs, stderr);
       }
       const value = extractJsonObject(text);
       return {

@@ -61,7 +61,8 @@ const rowIdentity = (row: GapRow): string => `${row.t}:${row.o ?? ""}:${row.n ??
  * Rows hidden from a hunk (for example by a change-group filter) would make
  * line numbers jump silently. With the unfiltered hunk as `original`, every
  * hidden run is located exactly, including at the start and end; without it,
- * holes in the old/new numbering between shown rows are reported.
+ * holes in the old/new numbering between shown rows give a lower bound, since a
+ * hidden context line advances both sides at once.
  */
 export function hunkGaps(rows: readonly GapRow[], original?: readonly GapRow[]): HunkGaps {
   if (original?.length) {
@@ -82,8 +83,9 @@ export function hunkGaps(rows: readonly GapRow[], original?: readonly GapRow[]):
   let nextNew: number | undefined;
   rows.forEach((row, index) => {
     let skipped = 0;
-    if (row.o != null && nextOld != null && row.o > nextOld) skipped += row.o - nextOld;
-    if (row.n != null && nextNew != null && row.n > nextNew) skipped += row.n - nextNew;
+    if (row.o != null && nextOld != null && row.o > nextOld) skipped = row.o - nextOld;
+    if (row.n != null && nextNew != null && row.n > nextNew)
+      skipped = Math.max(skipped, row.n - nextNew);
     if (skipped > 0) before.set(index, skipped);
     if (row.o != null) nextOld = row.o + 1;
     if (row.n != null) nextNew = row.n + 1;

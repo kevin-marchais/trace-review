@@ -1272,8 +1272,15 @@ void (async function () {
 
   // ---- current file (keyboard navigation target) ----
   let currentFile: UiElement | null = null;
+  // Set by j/k so a second press during the smooth scroll steps from the
+  // target instead of from whatever file is under the header mid-scroll.
+  let steppedFile: UiElement | null = null;
+  for (const type of ["wheel", "touchmove", "mousedown"]) {
+    window.addEventListener(type, () => (steppedFile = null), { passive: true });
+  }
   function setCurrentFile(fileEl: UiElement): void {
     currentFile = fileEl;
+    if (fileEl !== steppedFile) steppedFile = null;
   }
 
   // ---- LM review (inline rows + findings list) ----
@@ -1303,13 +1310,19 @@ void (async function () {
     return lineAnchors(pr, finding.file).has(finding.key);
   }
   const findingRowRefreshers = new Map<string, Set<() => void>>();
+  let findingRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   function lineCommentChanged(id: string): void {
     const refreshers = findingRowRefreshers.get(id);
     if (!refreshers?.size) return;
     refreshers.forEach((refresh) => refresh());
-    renderFindingList();
-    updateProgress();
-    refreshTree();
+    // The comment box saves on every keystroke; the list, progress and tree
+    // are rebuilt once typing pauses.
+    clearTimeout(findingRefreshTimer);
+    findingRefreshTimer = setTimeout(() => {
+      renderFindingList();
+      updateProgress();
+      refreshTree();
+    }, 250);
   }
   function insertAiRow(g: UiElement, c: AutomatedFinding, pr: string): void {
     const tr = g.closest("tr");
@@ -2163,6 +2176,9 @@ void (async function () {
     const gutters = [...row.querySelectorAll(".gutter[data-key]")];
     // prefer the new side in split view, matching GitHub
     hoveredGutter = gutters[gutters.length - 1] || hoveredGutter;
+  });
+  document.getElementById("main").addEventListener("mouseleave", () => {
+    hoveredGutter = null;
   });
 
   // ---- drag-select a contiguous diff range ----
@@ -4561,7 +4577,11 @@ void (async function () {
   // The file j/k/v/c act on: the last one navigated to while it is still on
   // screen, otherwise the first file under the sticky headers.
   function currentFileElement(files = navigableFiles()): UiElement | undefined {
-    if (currentFile?.isConnected && files.includes(currentFile) && inViewport(currentFile)) {
+    if (
+      currentFile?.isConnected &&
+      files.includes(currentFile) &&
+      (steppedFile === currentFile || inViewport(currentFile))
+    ) {
       return currentFile;
     }
     const offset = stickyOffset();
@@ -4580,6 +4600,7 @@ void (async function () {
     const group = next.closest(".group");
     if (group) group.classList.remove("collapsed");
     setCurrentFile(next);
+    steppedFile = next;
     scrollFileToTop(next);
     next.querySelector(".file-path")?.focus({ preventScroll: true });
   }
@@ -4665,7 +4686,8 @@ void (async function () {
   }
   // File blocks are wired by initFileElement.
   document.querySelectorAll(".group-head .group-title").forEach(bindHeaderToggle);
-  document.querySelectorAll(".group").forEach(syncExpanded);
+  // Startup collapses files restored as viewed before this observer exists.
+  document.querySelectorAll(".file, .group").forEach(syncExpanded);
   new MutationObserver((records) => {
     for (const record of records) {
       const element = record.target as UiElement;
