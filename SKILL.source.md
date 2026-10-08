@@ -42,6 +42,12 @@ attempt is kept in `.review/lm/attempt-N.json`; timing, tokens, and cost go
 to `.review/run-metrics.json`. Add `--language <name>` to write review prose in
 the user's language.
 
+A nested model run usually takes several minutes, longer than a default
+shell tool timeout. Run `--lm` in the background or with a long timeout (at
+least 10 minutes), or use the agent path below. For a pull request, the model
+reads repository files from the local checkout, so check out the PR head first
+(`gh pr checkout 8`) when findings should be checked against surrounding code.
+
 The page opens in a browser unless `--no-open` is given. Output names come
 from the target and never overwrite earlier reviews. `.review/` is added to the
 local Git exclude file.

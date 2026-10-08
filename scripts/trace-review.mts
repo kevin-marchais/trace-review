@@ -141,7 +141,7 @@ function reviewFileName(input: Pick<WorkflowInput, "mode" | "target">): string {
   const slug =
     target
       .normalize("NFKD")
-      .replace(/[̀-ͯ]/g, "")
+      .replace(/[\u0300-\u036f]/g, "")
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/^-+|-+$/g, "")
@@ -248,11 +248,23 @@ function readMetrics(file: string): Record<string, unknown> {
 }
 
 /** Write .review/lm/ for model-authored modes; returns null in workspace mode. */
-function writeBundle(inputPath: string, language?: string): LmBundle | null {
+function writeBundle(inputPath: string, language?: string, reuseLanguage = false): LmBundle | null {
   const input = readJson<WorkflowInput>(inputPath);
   if (input.mode === "workspace" || !input.findingContract) return null;
   const resolve = artifactResolver(inputPath, input);
   const context = readJson<{ preflight: PatchAnalysis; pullRequest?: unknown }>(resolve("context"));
+  // Keep the prepare-time --language so refine regenerates the same prompt.
+  const languagePath = path.join(resolve("lm"), "language.txt");
+  if (language?.trim()) {
+    fs.mkdirSync(path.dirname(languagePath), { recursive: true });
+    fs.writeFileSync(languagePath, `${language.trim()}\n`, "utf8");
+  } else if (reuseLanguage) {
+    try {
+      language = fs.readFileSync(languagePath, "utf8").trim() || undefined;
+    } catch {}
+  } else {
+    fs.rmSync(languagePath, { force: true });
+  }
   return writeLmBundle({
     dir: resolve("lm"),
     mode: input.mode,
@@ -493,6 +505,18 @@ async function review(args: CliArgs): Promise<void> {
   const repository = readJson<{ repository?: { root?: string } }>(resolve("context")).repository
     ?.root;
   const cwd = repository || path.resolve(args.repo);
+  if (input.target.number != null && input.target.headSha) {
+    const head = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd,
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    if (String(head.stdout || "").trim() !== input.target.headSha) {
+      console.warn(
+        `The checkout at ${cwd} is not the PR head (${input.target.headSha.slice(0, 12)}); the model may read stale surrounding code.`,
+      );
+    }
+  }
   const candidates = readJson<ChangeGrouping>(resolve("candidates"));
   const patch = fs.readFileSync(resolve("patch"), "utf8");
   const started = performance.now();
@@ -604,7 +628,7 @@ function refine(args: CliArgs): void {
     ruleCount: ruleSet.rules.length,
   };
   writeJson(inputPath, input);
-  if (input.workflow.lm) writeBundle(inputPath, args.language);
+  if (input.workflow.lm) writeBundle(inputPath, args.language, true);
 
   const metricsPath = resolveArtifact("metrics");
   writeJson(metricsPath, {

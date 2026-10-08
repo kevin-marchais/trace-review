@@ -753,6 +753,25 @@ test("provider failures are clear and only transient ones are retryable", async 
     run({ stderr: "boom" }),
     (error: unknown) => error instanceof ProviderError && error.retryable,
   );
+  // Auth words in files the model read must not turn a rate limit into a login error.
+  await assert.rejects(
+    run(
+      {
+        stdout: [
+          JSON.stringify({
+            type: "item.completed",
+            item: { text: "function authenticate() {} // 401" },
+          }),
+          JSON.stringify({
+            type: "turn.failed",
+            error: { message: "stream disconnected: rate limit" },
+          }),
+        ].join("\n"),
+      },
+      "codex",
+    ),
+    (error: unknown) => error instanceof ProviderError && error.retryable,
+  );
   await assert.rejects(
     createProvider("codex", { resolve: () => null }).run({
       prompt: "",
