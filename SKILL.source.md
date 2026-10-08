@@ -17,7 +17,7 @@ from the repository under review.
 ## Pick the command
 
 ```bash
-node <skill-dir>/scripts/trace-review.mjs [<target>] [--lm | --deep-audit] [--llm claude|codex|none] [--no-open] [-- <pathspec>...]
+node <skill-dir>/scripts/trace-review.mjs [<target>] [--lm | --deep-audit] [--llm claude|codex|none] [--serve] [--no-open] [-- <pathspec>...]
 ```
 
 | User says | Run |
@@ -45,6 +45,19 @@ the user's language.
 The page opens in a browser unless `--no-open` is given. Output names come
 from the target and never overwrite earlier reviews. `.review/` is added to the
 local Git exclude file.
+
+## Serve mode and reviewer feedback
+
+Add `--serve` (or run `trace-review.mjs serve [<target>]`) when the user wants
+to review in the page while you work. It keeps running until Ctrl+C, saves
+comments under `.review/state/`, and reloads the page when you rewrite
+`.review/lm/result.json`. After the user says they reviewed it, run:
+
+```bash
+node <skill-dir>/scripts/trace-review.mjs feedback --latest
+```
+
+Act on the accepted findings and the reviewer's comments it prints.
 
 ## Agent path: write the result yourself
 
