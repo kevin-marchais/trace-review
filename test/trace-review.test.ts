@@ -36,7 +36,8 @@ test("prepare and finish provide one bounded orchestration path", (t) => {
     [cli, "prepare", "--repo", repository, "--pr", "none", "--base", "HEAD", "--mode", "lm"],
     repository,
   );
-  assert.match(prepared.stdout, /Write one combined result/);
+  assert.match(prepared.stdout, /Write one result matching .*result.schema.json/);
+  assert.ok(fs.existsSync(path.join(repository, ".review", "lm", "prompt.md")));
 
   const reviewDir = path.join(repository, ".review");
   const inputPath = path.join(reviewDir, "analysis-input.json");
@@ -96,7 +97,7 @@ test("prepare and finish provide one bounded orchestration path", (t) => {
   assert.equal(spec.prs[0].review.verdict, "comment");
   assert.equal(metrics.expectedAgentActions, 5);
   assert.equal(metrics.prepare.internalCommands, 3);
-  assert.equal(metrics.finish.internalCommands, 3);
+  assert.equal(metrics.finish.internalCommands, 1);
 });
 
 test("refine applies adaptive detector rules before semantic grouping", (t) => {
@@ -313,5 +314,179 @@ test(
     const exclude = path.join(repository, ".git", "info", "exclude");
     const excluded = fs.existsSync(exclude) ? fs.readFileSync(exclude, "utf8") : "";
     assert.doesNotMatch(excluded, /^\.review\/$/m);
+  },
+);
+
+function initRepository(prefix: string): string {
+  const repository = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  run("git", ["init", "-b", "main"], repository);
+  run("git", ["config", "user.email", "test@example.com"], repository);
+  run("git", ["config", "user.name", "Trace Review Test"], repository);
+  fs.writeFileSync(path.join(repository, "app.js"), "export const value = 1;\n");
+  fs.writeFileSync(path.join(repository, "other.js"), "export const other = 1;\n");
+  run("git", ["add", "."], repository);
+  run("git", ["commit", "-m", "Initial"], repository);
+  return repository;
+}
+
+test("quick review supports --cached and pathspecs", { timeout: 20_000 }, (t) => {
+  const repository = initRepository("trace-review-cached-");
+  t.after(() => fs.rmSync(repository, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(repository, "app.js"), "export const value = 2;\n");
+  run("git", ["add", "app.js"], repository);
+  fs.writeFileSync(path.join(repository, "app.js"), "export const value = 3;\n");
+  fs.writeFileSync(path.join(repository, "other.js"), "export const other = 2;\n");
+  const reviewDir = path.join(repository, ".review");
+
+  run(process.execPath, [cli, "--cached", "--repo", repository, "--no-open"], repository);
+  const staged = fs.readFileSync(path.join(reviewDir, "context.patch"), "utf8");
+  assert.match(staged, /\+export const value = 2;/);
+  assert.doesNotMatch(staged, /value = 3|other/);
+  const files = JSON.parse(fs.readFileSync(path.join(reviewDir, "context.files.json"), "utf8"));
+  assert.equal(files.files[0].content, "export const value = 2;\n");
+  const context = JSON.parse(fs.readFileSync(path.join(reviewDir, "context.json"), "utf8"));
+  assert.equal(context.git.headRef, "INDEX");
+  assert.equal(context.git.diffLabel, "Staged changes");
+
+  run(process.execPath, [cli, "--repo", repository, "--no-open", "--", "other.js"], repository);
+  const scoped = fs.readFileSync(path.join(reviewDir, "context.patch"), "utf8");
+  assert.match(scoped, /other = 2/);
+  assert.doesNotMatch(scoped, /app\.js/);
+});
+
+test(
+  "--lm --llm none prepares the bundle and finish accepts candidate-group references",
+  { timeout: 20_000 },
+  (t) => {
+    const repository = initRepository("trace-review-agent-");
+    t.after(() => fs.rmSync(repository, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(repository, "app.js"), "export const value = 2;\n");
+    const prepared = run(
+      process.execPath,
+      [cli, "--lm", "--llm", "none", "--repo", repository],
+      repository,
+    );
+    const lmDir = path.join(repository, ".review", "lm");
+    for (const file of ["input.json", "context.lm.patch", "result.schema.json", "prompt.md"]) {
+      assert.ok(fs.existsSync(path.join(lmDir, file)), file);
+    }
+    assert.match(prepared.stdout, /finish --input .* --result .*result\.json/);
+    const input = JSON.parse(fs.readFileSync(path.join(lmDir, "input.json"), "utf8"));
+    const resultPath = path.join(lmDir, "result.json");
+    fs.writeFileSync(
+      resultPath,
+      JSON.stringify({
+        summary: "Updates the exported value.",
+        groups: [
+          {
+            title: "Exported value update",
+            intent: "Review the value change.",
+            risk: "low",
+            confidence: 0.9,
+            evidence: ["One hunk."],
+            reviewerChecks: ["Confirm consumers."],
+            titleEvidence: { changeIds: ["app.js#h0"], rationale: "The hunk changes the value." },
+            from: [input.candidateGroups[0].id],
+          },
+        ],
+        review: {
+          verdict: "comment",
+          global: "Small change.",
+          findings: [
+            {
+              row: "app.js#h0:a1",
+              severity: "question",
+              body: "Is `2` the intended value?",
+              confidence: 0.5,
+              rationale: "The patch alone does not say why.",
+              options: ["Confirm 2", "Revert to 1"],
+            },
+          ],
+        },
+      }),
+    );
+    const inputPath = path.join(repository, ".review", "analysis-input.json");
+    run(
+      process.execPath,
+      [cli, "finish", "--input", inputPath, "--result", resultPath],
+      repository,
+    );
+    const spec = JSON.parse(fs.readFileSync(path.join(repository, ".review", "spec.json"), "utf8"));
+    const comment = spec.prs[0].review.comments[0];
+    assert.deepEqual({ file: comment.file, line: comment.line }, { file: "app.js", line: 1 });
+  },
+);
+
+test(
+  "--lm --llm claude runs the provider, retries once, and builds the review",
+  { timeout: 30_000 },
+  (t) => {
+    const repository = initRepository("trace-review-provider-");
+    const fakeDir = fs.mkdtempSync(path.join(os.tmpdir(), "trace-review-fake-claude-"));
+    t.after(() => {
+      fs.rmSync(repository, { recursive: true, force: true });
+      fs.rmSync(fakeDir, { recursive: true, force: true });
+    });
+    fs.writeFileSync(path.join(repository, "app.js"), "export const value = 2;\n");
+    const state = path.join(fakeDir, "calls.txt");
+    const argsFile = path.join(fakeDir, "args.json");
+    const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+let prompt = "";
+process.stdin.on("data", (chunk) => (prompt += chunk));
+process.stdin.on("end", () => {
+  const state = ${JSON.stringify(state)};
+  const calls = (fs.existsSync(state) ? Number(fs.readFileSync(state, "utf8")) : 0) + 1;
+  fs.writeFileSync(state, String(calls));
+  fs.writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));
+  const from = [...new Set([...prompt.matchAll(/"id":"(g\\d+)"/g)].map((m) => m[1]))];
+  const result = {
+    summary: calls === 1 ? "" : "Updates the exported value.",
+    groups: [{ title: "Exported value update", intent: "Review it.", risk: "low", confidence: 0.9,
+      evidence: ["One hunk."], reviewerChecks: ["Check it."],
+      titleEvidence: { changeIds: ["app.js#h0"], rationale: "The hunk changes the value." },
+      from, changeIds: null, readAfter: null, kind: null }],
+    review: { verdict: "approve", global: "Fine.", findings: [] },
+  };
+  process.stdout.write(JSON.stringify({ type: "result", is_error: false, result: "",
+    structured_output: result, total_cost_usd: 0.001, usage: { input_tokens: 10, output_tokens: 5 } }));
+});
+`;
+    fs.writeFileSync(path.join(fakeDir, "fake-claude.cjs"), script);
+    if (process.platform === "win32") {
+      fs.writeFileSync(
+        path.join(fakeDir, "claude.cmd"),
+        '@ECHO off\r\n"%dp0%\\fake-claude.cjs" %*\r\n',
+      );
+    } else {
+      fs.writeFileSync(path.join(fakeDir, "claude"), script, { mode: 0o755 });
+    }
+    const env: NodeJS.ProcessEnv = {};
+    for (const [key, value] of Object.entries(process.env)) {
+      if (key.toLowerCase() !== "path") env[key] = value;
+    }
+    env.PATH = `${fakeDir}${path.delimiter}${process.env.PATH ?? process.env.Path ?? ""}`;
+    const result = spawnSync(
+      process.execPath,
+      [cli, "--lm", "--llm", "claude", "--model", "sonnet", "--repo", repository, "--no-open"],
+      { cwd: repository, encoding: "utf8", windowsHide: true, env },
+    );
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /Attempt 1 rejected:\n- summary: /);
+    assert.equal(fs.readFileSync(state, "utf8"), "2");
+    const args = JSON.parse(fs.readFileSync(argsFile, "utf8"));
+    assert.equal(args[args.indexOf("--model") + 1], "sonnet");
+    const lmDir = path.join(repository, ".review", "lm");
+    assert.ok(fs.existsSync(path.join(lmDir, "attempt-1.json")));
+    assert.ok(fs.existsSync(path.join(lmDir, "attempt-2.json")));
+    const metrics = JSON.parse(
+      fs.readFileSync(path.join(repository, ".review", "run-metrics.json"), "utf8"),
+    );
+    assert.equal(metrics.llm.provider, "claude");
+    assert.equal(metrics.llm.attempts.length, 2);
+    assert.equal(metrics.llm.costUsd, 0.002);
+    assert.equal(metrics.llm.inputTokens, 20);
+    const html = path.join(repository, ".review", "review-lm-analysis-working-tree-changes.html");
+    assert.ok(fs.statSync(html).size > 0);
   },
 );

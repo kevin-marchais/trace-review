@@ -6,28 +6,23 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 import { createHash } from "node:crypto";
-import { errorMessage, parseJson, requiredValue } from "./lib/cli.mjs";
-import { detectChangeGroups } from "./lib/change-groups.mjs";
+import { errorMessage, parseJson } from "./lib/cli.mjs";
+import { parseCliArgs, UsageError, type CliArgs } from "./lib/cli-args.mjs";
+import { detectChangeGroups, type ChangeGrouping } from "./lib/change-groups.mjs";
+import { DiagnosticError } from "./lib/diagnostics.mjs";
+import { loadSchema, stripNulls, validateJsonSchema } from "./lib/json-schema.mjs";
+import { analysisResultToReview, type AnalysisInput } from "./lib/lm-analysis.mjs";
+import { composeProviderPrompt, writeLmBundle, type LmBundle } from "./lib/lm-bundle.mjs";
+import { finalizeLmGrouping } from "./lib/lm-groups.mjs";
+import { runReviewLoop, type AttemptRecord } from "./lib/lm-loop.mjs";
+import { createProvider, detectProvider, ProviderError, type ProviderName } from "./lib/llm.mjs";
+import type { PatchAnalysis } from "./lib/preflight.mjs";
 import { parseDetectorRuleSet } from "./lib/repeated-changes.mjs";
-
-type ReviewMode = "workspace" | "lm-analysis" | "deep-audit";
-
-interface Args {
-  command?: "quick" | "prepare" | "refine" | "finish";
-  repo: string;
-  pr: string;
-  mode: ReviewMode;
-  base?: string;
-  revisions?: string[];
-  dir?: string;
-  input?: string;
-  result?: string;
-  rules?: string;
-  out?: string;
-  explicit: boolean;
-  open: boolean;
-  help?: boolean;
-}
+import {
+  DETECTOR_RULES_SCHEMA,
+  validateReviewResult,
+  type ReviewMode,
+} from "./lib/review-result.mjs";
 
 interface WorkflowInput {
   schemaVersion: 1;
@@ -43,12 +38,8 @@ interface WorkflowInput {
   };
   diff: { path?: string; source?: string; bytes: number };
   facts: {
-    preflight: {
-      totals: { files: number; additions: number; deletions: number; bytes: number };
-    };
-    changeGroups: {
-      inventory: Array<{ id: string }>;
-    };
+    preflight: PatchAnalysis;
+    changeGroups: ChangeGrouping;
   };
   findingContract?: { maxFindings: number };
   groupingContract: {
@@ -70,6 +61,7 @@ interface WorkflowInput {
     spec: string;
     html: string;
     metrics: string;
+    lm?: string;
   };
   adaptiveDetection?: {
     rules: string;
@@ -82,76 +74,38 @@ interface CombinedResult {
   summary?: string;
   groups?: unknown[];
   groupingProvenance?: "deterministic";
-  review?: {
-    verdict?: string;
-    global?: string;
-    findings?: unknown[];
-  };
+  review?: unknown;
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = (name: string): string => path.join(__dirname, `${name}.mjs`);
+const SELF = path.join(__dirname, "trace-review.mjs");
+
+const USAGE = `Usage:
+  trace-review [<target>] [--lm | --deep-audit] [--llm claude|codex|none]
+    [--model <id>] [--max-retries <n>] [--timeout <seconds>] [--language <name>]
+    [--repo <path>] [--dir <path>] [--out <review.html>] [--no-open]
+    [-- <pathspec>...]
+
+  Targets:  (none)           working tree versus the index
+            --cached         staged changes (alias --staged), optionally versus <rev>
+            <rev> [<rev>]    one or two revisions
+            <a>..<b>, <a>...<b>  two-dot or merge-base range
+            pr <n>, #<n>, <GitHub PR URL>  a pull request
+
+  Without --lm the review is deterministic and needs no model. With --lm or
+  --deep-audit, the selected CLI writes the review result (default: claude,
+  then codex, from PATH); --llm none prepares .review/lm/ for an agent.
+
+  trace-review prepare [--repo <path>] [--pr auto|none|<number|url>]
+    [--mode workspace|lm-analysis|deep-audit] [--base <ref>] [--dir <path>] [--explicit]
+  trace-review refine --input <analysis-input.json> --rules <detector-rules.json>
+  trace-review finish --input <analysis-input.json> --result <result.json> [--out <file>] [--open]`;
 
 function usage(message?: string): never {
   if (message) console.error(`Error: ${message}`);
-  console.error(`Usage:
-  node trace-review.mjs [quick] [<revision> [<revision>]] [--repo <path>]
-    [--base <ref>] [--dir <path>] [--out <review.html>] [--no-open]
-
-  node trace-review.mjs prepare [--repo <path>] [--pr auto|none|<number|url>]
-    [--mode workspace|lm-analysis|deep-audit] [--base <ref>] [--dir <path>]
-    [--explicit]
-
-  node trace-review.mjs refine --input <analysis-input.json>
-    --rules <detector-rules.json>
-
-  node trace-review.mjs finish --input <analysis-input.json>
-    --result <review-result.json> [--out <review.html>] [--open]`);
+  console.error(USAGE);
   process.exit(message ? 1 : 0);
-}
-
-function normalizeMode(value: string): ReviewMode {
-  if (value === "lm" || value === "ai") return "lm-analysis";
-  if (value === "workspace" || value === "lm-analysis" || value === "deep-audit") return value;
-  usage("--mode must be workspace, lm-analysis, or deep-audit");
-}
-
-function parseArgs(argv: readonly string[]): Args {
-  const first = argv[0];
-  const command =
-    first === "quick" || first === "prepare" || first === "refine" || first === "finish"
-      ? first
-      : "quick";
-  const args: Args = {
-    command,
-    repo: process.cwd(),
-    pr: command === "quick" ? "none" : "auto",
-    mode: "workspace",
-    ...(command === "quick" ? { revisions: [] } : {}),
-    explicit: false,
-    open: command === "quick",
-  };
-  const optionStart =
-    first === "quick" || first === "prepare" || first === "refine" || first === "finish" ? 1 : 0;
-  for (let index = optionStart; index < argv.length; index++) {
-    const arg = argv[index];
-    if (arg === "--repo") args.repo = requiredValue(argv, index++, arg, usage);
-    else if (arg === "--pr") args.pr = requiredValue(argv, index++, arg, usage);
-    else if (arg === "--mode") args.mode = normalizeMode(requiredValue(argv, index++, arg, usage));
-    else if (arg === "--base") args.base = requiredValue(argv, index++, arg, usage);
-    else if (arg === "--dir") args.dir = requiredValue(argv, index++, arg, usage);
-    else if (arg === "--input") args.input = requiredValue(argv, index++, arg, usage);
-    else if (arg === "--result") args.result = requiredValue(argv, index++, arg, usage);
-    else if (arg === "--rules") args.rules = requiredValue(argv, index++, arg, usage);
-    else if (arg === "--out") args.out = requiredValue(argv, index++, arg, usage);
-    else if (arg === "--explicit") args.explicit = true;
-    else if (arg === "--open") args.open = true;
-    else if (arg === "--no-open") args.open = false;
-    else if (arg === "--help" || arg === "-h") args.help = true;
-    else if (args.command === "quick" && !arg.startsWith("-")) args.revisions?.push(arg);
-    else usage(`Unknown option: ${arg}`);
-  }
-  return args;
 }
 
 function runScript(name: string, args: readonly string[], cwd: string): void {
@@ -172,6 +126,10 @@ function writeJson(file: string, value: unknown): void {
   fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
+function readJson<T>(file: string): T {
+  return parseJson(fs.readFileSync(file, "utf8")) as T;
+}
+
 function relative(fromFile: string, target: string): string {
   return path.relative(path.dirname(fromFile), target).replaceAll("\\", "/");
 }
@@ -183,7 +141,7 @@ function reviewFileName(input: Pick<WorkflowInput, "mode" | "target">): string {
   const slug =
     target
       .normalize("NFKD")
-      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[̀-ͯ]/g, "")
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/^-+|-+$/g, "")
@@ -257,7 +215,41 @@ function ensureReviewExcluded(repositoryRoot: string, outputDir: string): void {
   fs.appendFileSync(excludePath, `${prefix}.review/\n`, "utf8");
 }
 
-function prepare(args: Args, announceNext = true): void {
+function artifactResolver(inputPath: string, input: WorkflowInput) {
+  const baseDir = path.dirname(inputPath);
+  return (artifact: keyof WorkflowInput["workflow"]): string =>
+    path.resolve(baseDir, input.workflow[artifact] || "");
+}
+
+function readMetrics(file: string): Record<string, unknown> {
+  try {
+    return readJson<Record<string, unknown>>(file);
+  } catch {
+    return {};
+  }
+}
+
+/** Write .review/lm/ for model-authored modes; returns null in workspace mode. */
+function writeBundle(inputPath: string, language?: string): LmBundle | null {
+  const input = readJson<WorkflowInput>(inputPath);
+  if (input.mode === "workspace" || !input.findingContract) return null;
+  const resolve = artifactResolver(inputPath, input);
+  const context = readJson<{ preflight: PatchAnalysis; pullRequest?: unknown }>(resolve("context"));
+  return writeLmBundle({
+    dir: resolve("lm"),
+    mode: input.mode,
+    input: input as unknown as AnalysisInput,
+    candidates: readJson<ChangeGrouping>(resolve("candidates")),
+    patch: fs.readFileSync(resolve("patch"), "utf8"),
+    preflight: context.preflight,
+    pullRequest: (context.pullRequest || null) as Parameters<
+      typeof writeLmBundle
+    >[0]["pullRequest"],
+    language,
+  });
+}
+
+function prepare(args: CliArgs, announceNext = true): string {
   const started = performance.now();
   const repository = path.resolve(args.repo);
   const outputDir = path.resolve(args.dir || path.join(repository, ".review"));
@@ -267,9 +259,6 @@ function prepare(args: Args, announceNext = true): void {
   const inputPath = path.join(outputDir, "analysis-input.json");
   const candidatesPath = path.join(outputDir, "candidates.json");
   const resultPath = path.join(outputDir, "review-result.json");
-  const groupsPath = path.join(outputDir, "groups.json");
-  const reviewPath = path.join(outputDir, "review.json");
-  const specPath = path.join(outputDir, "spec.json");
   const metricsPath = path.join(outputDir, "run-metrics.json");
 
   const collectArgs = [
@@ -287,12 +276,11 @@ function prepare(args: Args, announceNext = true): void {
     ...(args.revisions !== undefined
       ? ["--git-diff", ...args.revisions.flatMap((revision) => ["--revision", revision])]
       : []),
+    ...(args.cached ? ["--cached"] : []),
+    ...(args.pathspecs.length ? ["--", ...args.pathspecs] : []),
   ];
   runScript("collect-pr-context", collectArgs, repository);
-  const context = parseJson(fs.readFileSync(contextPath, "utf8")) as {
-    repository?: { root?: string };
-    changeGroups?: unknown;
-  };
+  const context = readJson<{ repository?: { root?: string }; changeGroups?: unknown }>(contextPath);
   writeJson(candidatesPath, context.changeGroups);
   ensureReviewExcluded(context.repository?.root || repository, outputDir);
 
@@ -309,7 +297,7 @@ function prepare(args: Args, announceNext = true): void {
     ],
     repository,
   );
-  const input = parseJson(fs.readFileSync(inputPath, "utf8")) as Record<string, unknown>;
+  const input = readJson<Record<string, unknown>>(inputPath);
   input.mode = args.mode;
   input.groupingContract = {
     required: [
@@ -320,11 +308,10 @@ function prepare(args: Args, announceNext = true): void {
       "evidence",
       "reviewerChecks",
       "titleEvidence",
-      "changeIds",
-      "readAfter",
+      "from or changeIds",
     ],
     guidance:
-      "Preserve detector-authored repeated-change units as dedicated mechanical groups. Assign every candidate change ID exactly once. Use change-specific titles grounded in titleEvidence; never reuse classifier labels.",
+      "Reference candidate groups with from and move single changes with changeIds; unassigned changes are auto-placed in their candidate group. Keep repeated-change units in dedicated groups. Use change-specific titles grounded in titleEvidence.",
   };
   input.resultContract = {
     path: relative(inputPath, resultPath),
@@ -339,17 +326,19 @@ function prepare(args: Args, announceNext = true): void {
     patch: relative(inputPath, patchPath),
     fileContents: relative(inputPath, filesPath),
     candidates: relative(inputPath, candidatesPath),
-    groups: relative(inputPath, groupsPath),
-    review: relative(inputPath, reviewPath),
-    spec: relative(inputPath, specPath),
+    groups: relative(inputPath, path.join(outputDir, "groups.json")),
+    review: relative(inputPath, path.join(outputDir, "review.json")),
+    spec: relative(inputPath, path.join(outputDir, "spec.json")),
     html: relative(
       inputPath,
       path.join(outputDir, reviewFileName(input as unknown as WorkflowInput)),
     ),
     metrics: relative(inputPath, metricsPath),
+    lm: relative(inputPath, path.join(outputDir, "lm")),
   };
   if (args.mode === "workspace") delete input.findingContract;
   writeJson(inputPath, input);
+  const bundle = writeBundle(inputPath, args.language);
 
   const prepared = input as unknown as WorkflowInput;
   writeJson(metricsPath, {
@@ -361,17 +350,35 @@ function prepare(args: Args, announceNext = true): void {
       internalCommands: 3,
     },
     facts: prepared.facts.preflight.totals,
+    ...(bundle ? { bundle: bundleSizes(bundle) } : {}),
   });
   console.log(`Prepared ${prepared.target.title}`);
-  console.log(
-    `Read ${inputPath} and ${path.resolve(path.dirname(inputPath), prepared.diff.path || "")}`,
-  );
   if (announceNext) {
-    console.log(`Write one combined result to ${resultPath}`);
-    console.log(
-      `Then run: node "${path.join(__dirname, "trace-review.mjs")}" finish --input "${inputPath}" --result "${resultPath}" --open`,
-    );
+    if (bundle) {
+      console.log(`Read ${bundle.prompt}, ${bundle.input}, and ${bundle.patch}`);
+      console.log(`Write one result matching ${bundle.schema} to ${bundle.result}`);
+      console.log(
+        `Then run: node "${SELF}" finish --input "${inputPath}" --result "${bundle.result}" --open`,
+      );
+    } else {
+      console.log(`Read ${inputPath} and ${patchPath}`);
+      console.log(`Write one combined result to ${resultPath}`);
+      console.log(
+        `Then run: node "${SELF}" finish --input "${inputPath}" --result "${resultPath}" --open`,
+      );
+    }
   }
+  return inputPath;
+}
+
+function bundleSizes(bundle: LmBundle): Record<string, number> {
+  const size = (file: string): number => fs.statSync(file).size;
+  return {
+    inputBytes: size(bundle.input),
+    patchBytes: size(bundle.patch),
+    promptBytes: size(bundle.prompt),
+    schemaBytes: size(bundle.schema),
+  };
 }
 
 interface QuickCandidateGroup {
@@ -439,48 +446,133 @@ function quickResult(input: WorkflowInput, candidates: QuickCandidates): Combine
   };
 }
 
-function quick(args: Args): void {
-  if (args.mode !== "workspace") {
-    throw new Error(
-      "Quick mode supports workspace reviews only; use prepare and finish for LM analysis.",
-    );
-  }
-  prepare(args, false);
-
-  const repository = path.resolve(args.repo);
-  const outputDir = path.resolve(args.dir || path.join(repository, ".review"));
-  const inputPath = path.join(outputDir, "analysis-input.json");
-  const resultPath = path.join(outputDir, "review-result.json");
-  const input = parseJson(fs.readFileSync(inputPath, "utf8")) as WorkflowInput;
-  const candidatesPath = path.resolve(path.dirname(inputPath), input.workflow.candidates);
-  const candidates = parseJson(fs.readFileSync(candidatesPath, "utf8")) as QuickCandidates;
+function quick(args: CliArgs): void {
+  const inputPath = prepare(args, false);
+  const input = readJson<WorkflowInput>(inputPath);
+  const resultPath = path.join(path.dirname(inputPath), "review-result.json");
+  const candidates = readJson<QuickCandidates>(artifactResolver(inputPath, input)("candidates"));
   writeJson(resultPath, quickResult(input, candidates));
-
-  finish({
-    ...args,
-    command: "finish",
-    input: inputPath,
-    result: resultPath,
-  });
+  finish({ ...args, command: "finish", input: inputPath, result: resultPath });
 }
 
-function refine(args: Args): void {
+async function review(args: CliArgs): Promise<void> {
+  if (args.mode === "workspace") {
+    quick(args);
+    return;
+  }
+  const provider: ProviderName | null =
+    args.llm === "none" ? null : args.llm === "auto" ? detectProvider() : args.llm;
+  if (args.llm === "auto" && !provider) {
+    console.warn("No claude or codex CLI was found on PATH; preparing the bundle for an agent.");
+  }
+  const inputPath = prepare(args, !provider);
+  if (!provider) return;
+
+  const input = readJson<WorkflowInput>(inputPath);
+  const resolve = artifactResolver(inputPath, input);
+  const bundle = writeBundle(inputPath, args.language);
+  if (!bundle) throw new Error("The LM bundle was not prepared.");
+  const repository = readJson<{ repository?: { root?: string } }>(resolve("context")).repository
+    ?.root;
+  const cwd = repository || path.resolve(args.repo);
+  const candidates = readJson<ChangeGrouping>(resolve("candidates"));
+  const patch = fs.readFileSync(resolve("patch"), "utf8");
+  const started = performance.now();
+  let loop: Awaited<ReturnType<typeof runReviewLoop>>;
+  try {
+    loop = await runReviewLoop({
+      provider: createProvider(provider),
+      request: {
+        repo: cwd,
+        schemaPath: bundle.strictSchema,
+        timeoutMs: args.timeoutMs,
+        ...(args.model ? { model: args.model } : {}),
+      },
+      prompt: composeProviderPrompt(bundle, cwd),
+      dir: bundle.dir,
+      maxRetries: args.maxRetries,
+      validate: (value) =>
+        validateReviewResult(value, {
+          mode: input.mode,
+          candidates,
+          analysisInput: input as unknown as AnalysisInput,
+          patch,
+        }),
+      log: (message) => console.log(message),
+    });
+  } catch (error: unknown) {
+    if (error instanceof ProviderError) {
+      throw new Error(
+        `${error.message}\nThe bundle is ready in ${bundle.dir}; write ${bundle.result} yourself and run: node "${SELF}" finish --input "${inputPath}" --result "${bundle.result}"`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+  const llmMetrics = summarizeAttempts(provider, args.model, loop.attempts, started);
+  const metricsPath = resolve("metrics");
+  writeJson(metricsPath, { ...readMetrics(metricsPath), llm: llmMetrics });
+  if (!loop.valid) {
+    throw new DiagnosticError(
+      `${provider} did not produce a valid result after ${loop.attempts.length} attempt(s); attempts are in ${bundle.dir}. Fix ${bundle.result} and run finish:`,
+      loop.diagnostics,
+    );
+  }
+  writeJson(bundle.result, stripNulls(loop.value));
+  console.log(`Wrote ${bundle.result}`);
+  finish({ ...args, command: "finish", input: inputPath, result: bundle.result }, llmMetrics);
+}
+
+function summarizeAttempts(
+  provider: string,
+  model: string | undefined,
+  attempts: readonly AttemptRecord[],
+  started: number,
+): Record<string, unknown> {
+  const sum = (pick: (attempt: AttemptRecord) => number | undefined): number | undefined => {
+    const values = attempts.map(pick).filter((value): value is number => value !== undefined);
+    return values.length ? values.reduce((left, right) => left + right, 0) : undefined;
+  };
+  const costUsd = sum((attempt) => attempt.costUsd);
+  return {
+    provider,
+    ...(model ? { model } : {}),
+    attempts: attempts.map((attempt) => ({
+      attempt: attempt.attempt,
+      durationMs: attempt.durationMs,
+      valid: attempt.valid,
+      diagnostics: attempt.diagnostics.length,
+      ...(attempt.usage ? { usage: attempt.usage } : {}),
+      ...(attempt.costUsd !== undefined ? { costUsd: attempt.costUsd } : {}),
+      ...(attempt.error ? { error: attempt.error } : {}),
+    })),
+    durationMs: Math.round(performance.now() - started),
+    inputTokens: sum((attempt) => attempt.usage?.inputTokens),
+    outputTokens: sum((attempt) => attempt.usage?.outputTokens),
+    ...(costUsd !== undefined ? { costUsd: Math.round(costUsd * 1e6) / 1e6 } : {}),
+  };
+}
+
+function refine(args: CliArgs): void {
   if (!args.input) usage("refine requires --input");
   if (!args.rules) usage("refine requires --rules");
   const inputPath = path.resolve(args.input);
   const rulesPath = path.resolve(args.rules);
-  const input = parseJson(fs.readFileSync(inputPath, "utf8")) as WorkflowInput;
-  const baseDir = path.dirname(inputPath);
-  const resolveArtifact = (artifact: keyof WorkflowInput["workflow"]): string =>
-    path.resolve(baseDir, input.workflow[artifact]);
+  const input = readJson<WorkflowInput>(inputPath);
+  const resolveArtifact = artifactResolver(inputPath, input);
   const ruleSource = fs.readFileSync(rulesPath, "utf8");
-  const ruleSet = parseDetectorRuleSet(parseJson(ruleSource));
+  const rules = parseJson(ruleSource);
+  const schemaDiagnostics = validateJsonSchema(loadSchema(DETECTOR_RULES_SCHEMA), rules);
+  if (schemaDiagnostics.length) {
+    throw new DiagnosticError("Invalid detector rules:", schemaDiagnostics);
+  }
+  const ruleSet = parseDetectorRuleSet(rules);
   const patch = fs.readFileSync(resolveArtifact("patch"), "utf8");
   const contextPath = resolveArtifact("context");
-  const context = parseJson(fs.readFileSync(contextPath, "utf8")) as {
+  const context = readJson<{
     preflight?: Parameters<typeof detectChangeGroups>[1];
     changeGroups?: unknown;
-  };
+  }>(contextPath);
   const changeGroups = detectChangeGroups(patch, context.preflight, {
     detectorRules: ruleSet.rules,
   });
@@ -493,17 +585,12 @@ function refine(args: Args): void {
     ruleHash: createHash("sha256").update(ruleSource).digest("hex"),
     ruleCount: ruleSet.rules.length,
   };
-  input.groupingContract.guidance =
-    "Preserve detector-authored repeated-change units as dedicated mechanical groups. Assign every candidate change ID exactly once and use change-specific titles grounded in titleEvidence.";
   writeJson(inputPath, input);
+  if (input.workflow.lm) writeBundle(inputPath, args.language);
 
   const metricsPath = resolveArtifact("metrics");
-  let metrics: Record<string, unknown> = {};
-  try {
-    metrics = parseJson(fs.readFileSync(metricsPath, "utf8")) as Record<string, unknown>;
-  } catch {}
   writeJson(metricsPath, {
-    ...metrics,
+    ...readMetrics(metricsPath),
     expectedAgentActions: 7,
     adaptiveDetection: {
       ruleCount: ruleSet.rules.length,
@@ -515,7 +602,7 @@ function refine(args: Args): void {
 }
 
 // Review IDs key browser storage, so they must change whenever the compared
-// commits change; working-tree reviews get their own marker.
+// commits change; working-tree and staged reviews get their own marker.
 function reviewContentKey(contextPath: string, fallbackHeadSha: string): string {
   let context: {
     source?: string;
@@ -523,7 +610,7 @@ function reviewContentKey(contextPath: string, fallbackHeadSha: string): string 
     pullRequest?: { baseSha?: string; headSha?: string } | null;
   } = {};
   try {
-    context = parseJson(fs.readFileSync(contextPath, "utf8")) as typeof context;
+    context = readJson<typeof context>(contextPath);
   } catch {}
   const github = context.source === "github";
   const baseSha = github
@@ -532,71 +619,58 @@ function reviewContentKey(contextPath: string, fallbackHeadSha: string): string 
   const headSha = github
     ? context.pullRequest?.headSha || fallbackHeadSha
     : context.git?.headSha || fallbackHeadSha;
-  const worktree = !github && (!context.git?.headRef || context.git.headRef === "WORKTREE");
+  const headRef = context.git?.headRef;
+  const marker = github
+    ? "commit"
+    : !headRef || headRef === "WORKTREE"
+      ? "worktree"
+      : headRef === "INDEX"
+        ? "index"
+        : "commit";
   return createHash("sha256")
-    .update([baseSha, headSha, worktree ? "worktree" : "commit"].join("\0"))
+    .update([baseSha, headSha, marker].join("\0"))
     .digest("hex")
     .slice(0, 12);
 }
 
-function finish(args: Args): void {
+function finish(args: CliArgs, llmMetrics?: Record<string, unknown>): void {
   if (!args.input) usage("finish requires --input");
   if (!args.result) usage("finish requires --result");
   const started = performance.now();
   const inputPath = path.resolve(args.input);
   const resultPath = path.resolve(args.result);
-  const input = parseJson(fs.readFileSync(inputPath, "utf8")) as WorkflowInput;
-  const result = parseJson(fs.readFileSync(resultPath, "utf8")) as CombinedResult;
-  if (typeof result.summary !== "string" || !result.summary.trim()) {
-    throw new Error("The combined result requires a non-empty summary.");
-  }
-  if (!Array.isArray(result.groups) || !result.groups.length) {
-    throw new Error("The combined result requires semantic groups.");
-  }
+  const input = readJson<WorkflowInput>(inputPath);
+  const raw = readJson<unknown>(resultPath);
   const baseDir = path.dirname(inputPath);
-  const resolveArtifact = (artifact: keyof WorkflowInput["workflow"]): string =>
-    path.resolve(baseDir, input.workflow[artifact]);
-  const groupingResultPath = path.join(baseDir, "grouping-result.json");
-  writeJson(groupingResultPath, { groups: result.groups });
-  runScript(
-    "finalize-lm-groups",
-    [
-      "--candidates",
-      resolveArtifact("candidates"),
-      "--result",
-      groupingResultPath,
-      "--out",
-      resolveArtifact("groups"),
-    ],
-    baseDir,
-  );
-  if (result.groupingProvenance === "deterministic") {
-    if (input.mode !== "workspace") {
-      throw new Error("Deterministic grouping provenance is valid only in workspace mode.");
-    }
-    const grouping = parseJson(fs.readFileSync(resolveArtifact("groups"), "utf8")) as Record<
-      string,
-      unknown
-    >;
-    grouping.provenance = "deterministic";
-    writeJson(resolveArtifact("groups"), grouping);
+  const resolveArtifact = artifactResolver(inputPath, input);
+  const candidates = readJson<ChangeGrouping>(resolveArtifact("candidates"));
+  const patch = fs.readFileSync(resolveArtifact("patch"), "utf8");
+  const analysisInput = input as unknown as AnalysisInput;
+  const validation = validateReviewResult(raw, {
+    mode: input.mode,
+    candidates,
+    analysisInput,
+    patch,
+  });
+  if (!validation.valid || !validation.resolved) {
+    throw new DiagnosticError(`Invalid result ${resultPath}:`, validation.diagnostics);
   }
+  const result = validation.resolved;
+  const grouping: Record<string, unknown> = { ...finalizeLmGrouping(result, candidates) };
+  if (result.groupingProvenance === "deterministic") grouping.provenance = "deterministic";
+  if (result.autoPlaced.length) {
+    grouping.placement = { autoPlaced: result.autoPlaced };
+    console.warn(
+      `Auto-placed ${result.autoPlaced.length} unassigned change(s) into their candidate groups.`,
+    );
+  }
+  writeJson(resolveArtifact("groups"), grouping);
 
   let review: unknown;
-  let internalCommands = 2;
   if (input.mode !== "workspace") {
     if (!result.review) throw new Error(`${input.mode} requires a review result.`);
-    const analysisResultPath = path.join(baseDir, "analysis-result.json");
-    writeJson(analysisResultPath, result.review);
-    runScript(
-      "finalize-lm-analysis",
-      ["--input", inputPath, "--result", analysisResultPath, "--out", resolveArtifact("review")],
-      baseDir,
-    );
-    review = parseJson(fs.readFileSync(resolveArtifact("review"), "utf8"));
-    internalCommands++;
-  } else if (result.review !== undefined) {
-    throw new Error("Workspace results must omit review.");
+    review = analysisResultToReview(result.review, analysisInput, { patch });
+    writeJson(resolveArtifact("review"), review);
   }
 
   const target = input.target;
@@ -643,13 +717,7 @@ function finish(args: Args): void {
       : "Existing review files: none",
   );
   console.log(`Reserved review output: ${htmlPath}`);
-  let preparedMetrics: Record<string, unknown> = {};
-  try {
-    preparedMetrics = parseJson(fs.readFileSync(resolveArtifact("metrics"), "utf8")) as Record<
-      string,
-      unknown
-    >;
-  } catch {}
+  const preparedMetrics = readMetrics(resolveArtifact("metrics"));
   try {
     runScript(
       "build-review",
@@ -671,27 +739,32 @@ function finish(args: Args): void {
     throw error;
   }
 
-  const buildMetrics = parseJson(fs.readFileSync(resolveArtifact("metrics"), "utf8")) as Record<
-    string,
-    unknown
-  >;
+  const buildMetrics = readMetrics(resolveArtifact("metrics"));
   writeJson(resolveArtifact("metrics"), {
     ...preparedMetrics,
     ...buildMetrics,
     expectedAgentActions: input.adaptiveDetection ? 7 : 5,
+    ...(llmMetrics ? { llm: llmMetrics } : {}),
+    ...(result.autoPlaced.length ? { autoPlacedChanges: result.autoPlaced.length } : {}),
     finish: {
       durationMs: Math.round((performance.now() - started) * 10) / 10,
-      internalCommands,
+      internalCommands: 1,
     },
   });
   console.log(`Built ${htmlPath}`);
   console.log(`Metrics ${resolveArtifact("metrics")}`);
 }
 
-const args = parseArgs(process.argv.slice(2));
-if (args.help || !args.command) usage();
+let args: CliArgs;
 try {
-  if (args.command === "quick") quick(args);
+  args = parseCliArgs(process.argv.slice(2));
+} catch (error: unknown) {
+  if (error instanceof UsageError) usage(error.message);
+  throw error;
+}
+if (args.help) usage();
+try {
+  if (args.command === "review") await review(args);
   else if (args.command === "prepare") prepare(args);
   else if (args.command === "refine") refine(args);
   else finish(args);

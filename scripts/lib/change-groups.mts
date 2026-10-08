@@ -202,7 +202,7 @@ export function parsePatchChanges(text: string, preflight: PreflightLike = {}): 
   return changes;
 }
 
-function isLockfile(file: string): boolean {
+export function isLockfile(file: string): boolean {
   return LOCKFILES.has(path.posix.basename(file).toLowerCase());
 }
 

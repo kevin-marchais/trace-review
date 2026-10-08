@@ -7,7 +7,11 @@ const runtimeRoot = path.join(root, "dist", "runtime");
 
 fs.rmSync(runtimeRoot, { recursive: true, force: true });
 
-for (const relativePath of ["schemas/review-spec.v1.schema.json"]) {
+for (const relativePath of [
+  "schemas/review-spec.v1.schema.json",
+  "schemas/review-result.v1.schema.json",
+  "schemas/detector-rules.v1.schema.json",
+]) {
   const source = path.join(root, relativePath);
   const destination = path.join(runtimeRoot, relativePath);
   fs.mkdirSync(path.dirname(destination), { recursive: true });
