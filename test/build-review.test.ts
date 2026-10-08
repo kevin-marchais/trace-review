@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { createReviewData } from "../src/review-data.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const fixtures = path.join(root, "test", "fixtures");
@@ -48,8 +49,8 @@ test("generator produces a complete, mode-labelled review document", (t) => {
   assert.match(html, /if \(hasBefore && hasAfter\)/);
   assert.match(html, /function buildCarbonSvg\(file, rows, layout\)/);
   assert.match(html, /function syntaxSegments\(html\)/);
-  assert.match(html, /function applyWordDiffMarkup\(highlightedHtml, wordDiffHtml\)/);
-  assert.match(html, /r\._hl = applyWordDiffMarkup\(r\._hl, r\.h\)/);
+  assert.match(html, /function applyWordDiffMarkup\(highlightedHtml, ranges, textLength\)/);
+  assert.match(html, /r\._hl = applyWordDiffMarkup\(r\._hl, r\.w, r\.c\.length\)/);
   assert.match(html, /\.wd \{ border-radius:2px; font-weight:700/);
   assert.doesNotMatch(html, /\.line-(?:add|del) \.wd \{[^}]*box-shadow/);
   assert.match(html, /function compactExportRows\(rows\)/);
@@ -179,17 +180,13 @@ test("module TypeScript and common extension aliases select syntax languages", (
   const result = build(path.join(tempDir, "spec.json"), out);
   assert.equal(result.status, 0, result.stderr);
   const html = fs.readFileSync(out, "utf8");
-  const dataSource = /<script id="review-data" type="application\/json">([\s\S]*?)<\/script>/.exec(
-    html,
-  )?.[1];
-  assert.ok(dataSource);
-  const data = JSON.parse(dataSource);
-  assert.equal(data["pr-1__0"].lang, "typescript");
-  assert.equal(data["pr-1__1"].lang, "cpp");
-  assert.equal(data["pr-1__2"].lang, "cpp");
-  assert.equal(data["pr-1__3"].lang, "graphql");
-  assert.match(data["pr-1__1"].hunks[0].rows[0].h, /class="wd"/);
-  assert.match(data["pr-1__1"].hunks[0].rows[1].h, /class="wd"/);
+  const data = embeddedData(html);
+  assert.equal(data.view("pr-1__0").lang, "typescript");
+  assert.equal(data.view("pr-1__1").lang, "cpp");
+  assert.equal(data.view("pr-1__2").lang, "cpp");
+  assert.equal(data.view("pr-1__3").lang, "graphql");
+  assert.deepEqual(data.view("pr-1__1").hunks[0].rows[0].w, [28, 29]);
+  assert.deepEqual(data.view("pr-1__1").hunks[0].rows[1].w, [28, 29]);
 });
 
 test("word diff pairs a deleted code line with the related added line instead of an inserted comment", (t) => {
@@ -223,17 +220,13 @@ test("word diff pairs a deleted code line with the related added line instead of
   const result = build(path.join(tempDir, "spec.json"), out);
   assert.equal(result.status, 0, result.stderr);
   const html = fs.readFileSync(out, "utf8");
-  const dataSource = /<script id="review-data" type="application\/json">([\s\S]*?)<\/script>/.exec(
-    html,
-  )?.[1];
-  assert.ok(dataSource);
-  const rows = JSON.parse(dataSource)["pr-1__0"].hunks[0].rows;
+  const rows = embeddedData(html).view("pr-1__0").hunks[0].rows;
 
-  assert.match(rows[0].h, /class="wd"/, "the deleted line should show its changed tokens");
-  assert.doesNotMatch(rows[1].h, /class="wd"/, "an inserted comment is not the replacement");
-  assert.doesNotMatch(rows[2].h, /class="wd"/, "an unrelated inserted statement stays unpaired");
-  assert.doesNotMatch(rows[3].h, /class="wd"/, "another inserted comment stays unpaired");
-  assert.match(rows[4].h, /class="wd"/, "the related added code line should be paired");
+  assert.ok(rows[0].w, "the deleted line should show its changed tokens");
+  assert.equal(rows[1].w, undefined, "an inserted comment is not the replacement");
+  assert.equal(rows[2].w, undefined, "an unrelated inserted statement stays unpaired");
+  assert.equal(rows[3].w, undefined, "another inserted comment stays unpaired");
+  assert.ok(rows[4].w, "the related added code line should be paired");
 });
 
 test("SVG whole-file content offers sanitized image and exact code views", (t) => {
@@ -279,12 +272,7 @@ test("SVG whole-file content offers sanitized image and exact code views", (t) =
   const result = build(path.join(tempDir, "spec.json"), out);
   assert.equal(result.status, 0, result.stderr);
   const html = fs.readFileSync(out, "utf8");
-  const dataSource = /<script id="review-data" type="application\/json">([\s\S]*?)<\/script>/.exec(
-    html,
-  )?.[1];
-  assert.ok(dataSource);
-  const data = JSON.parse(dataSource);
-  const fullFile = data["pr-1__0"].fullFile;
+  const fullFile = embeddedData(html).view("pr-1__0").fullFile;
   assert.equal(fullFile.content, svg);
   assert.match(fullFile.svgPreview, /style="fill:#2f81f7;stroke:#ffffff"/);
   assert.doesNotMatch(fullFile.svgPreview, /onload|script|metadata|evil\.example/);
@@ -675,13 +663,13 @@ test("Phase 5 fingerprints comments and exposes orphan recovery", (t) => {
   assert.equal(result.status, 0, result.stderr);
   const html = fs.readFileSync(out, "utf8");
 
-  assert.match(html, /"fingerprint":"[a-f0-9]{20}"/);
-  assert.match(html, /"f":"[a-f0-9]{20}"/);
-  assert.match(html, /"cf":"[a-f0-9]{20}"/);
-  assert.match(html, /data-diff-fingerprint=/);
-  assert.match(html, /data-content-fingerprint=/);
+  // Fingerprints are computed in the browser, not embedded per row.
+  assert.doesNotMatch(html, /"(?:f|cf|fingerprint)":"[a-f0-9]{20}"/);
+  assert.match(html, /function ensureFingerprints\(file\)/);
+  assert.match(html, /diffFingerprint/);
+  assert.match(html, /contentFingerprint/);
   assert.match(html, /function orphanedComments\(\)/);
-  assert.match(html, /currentLineAnchors/);
+  assert.match(html, /function lineAnchors\(pr, file\)/);
   assert.match(html, /uniqueContentFingerprint/);
   assert.match(html, /class="orphan-panel"/);
   assert.match(html, /### Orphaned comments/);
@@ -822,10 +810,20 @@ test("large reviews expose accessible search and combinable file filters", (t) =
   assert.match(html, /data-nav-results/);
 });
 
-function reviewData(html) {
+function rawReviewData(html) {
   const match = /<script id="review-data" type="application\/json">([\s\S]*?)<\/script>/.exec(html);
   assert.ok(match, "review data block is present");
-  return Object.values(JSON.parse(match[1]));
+  return JSON.parse(match[1]);
+}
+
+function embeddedData(html) {
+  return createReviewData(rawReviewData(html));
+}
+
+function reviewData(html) {
+  const raw = rawReviewData(html);
+  const data = createReviewData(raw);
+  return raw.files.map((_file, index) => data.file(index));
 }
 
 test("rendered diffs keep header-like content, decoded paths, and placeholder text intact", (t) => {
@@ -887,4 +885,94 @@ test("rendered diffs keep header-like content, decoded paths, and placeholder te
     html,
   );
   assert.deepEqual(JSON.parse(aiReview[1]), {});
+});
+
+test("each file's contents and rows are embedded once and the Git-order view starts inert", (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "trace-review-dedupe-"));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const fileText = (name) =>
+    Array.from({ length: 40 }, (_, line) => `export const ${name}Line${line} = ${line};`).join(
+      "\n",
+    ) + "\n";
+  const patch = ["alpha", "beta"]
+    .map((name) =>
+      [
+        `diff --git a/src/${name}.js b/src/${name}.js`,
+        `--- a/src/${name}.js`,
+        `+++ b/src/${name}.js`,
+        "@@ -1,2 +1,3 @@",
+        `-export const ${name}Old = 0;`,
+        `+import { helper } from "./helper.js";`,
+        `+export const ${name}Line0 = 0;`,
+        ` export const ${name}Line1 = 1;`,
+      ].join("\n"),
+    )
+    .join("\n");
+  fs.writeFileSync(path.join(tempDir, "change.patch"), patch + "\n");
+  fs.writeFileSync(
+    path.join(tempDir, "files.json"),
+    JSON.stringify({
+      schemaVersion: 1,
+      maxFileBytes: 1048576,
+      maxTotalBytes: 10485760,
+      files: ["alpha", "beta"].map((name) => ({
+        path: `src/${name}.js`,
+        revision: "head",
+        content: fileText(name),
+      })),
+    }),
+  );
+  fs.writeFileSync(
+    path.join(tempDir, "spec.json"),
+    JSON.stringify({
+      schemaVersion: 1,
+      mode: "workspace",
+      prs: [
+        {
+          title: "Dedupe",
+          diffFile: "change.patch",
+          fileContentsFile: "files.json",
+          autoGroups: true,
+        },
+      ],
+    }),
+  );
+  const out = path.join(tempDir, "review.html");
+  const result = build(path.join(tempDir, "spec.json"), out);
+  assert.equal(result.status, 0, result.stderr);
+  const html = fs.readFileSync(out, "utf8");
+  const raw = rawReviewData(html);
+  const count = (needle) => html.split(needle).length - 1;
+
+  assert.equal(raw.files.length, 2);
+  for (const name of ["alpha", "beta"]) {
+    // JSON escapes newlines, so the stored content appears exactly once.
+    assert.equal(count(JSON.stringify(fileText(name)).slice(1, -1)), 1, `${name} contents`);
+    assert.equal(count(`-export const ${name}Old = 0;`), 1, `${name} deleted row`);
+  }
+  assert.doesNotMatch(html, /class=\\"wd\\"|&lt;span/, "no escaped-HTML row copies");
+  assert.ok(Object.keys(raw.views).some((fid) => fid.includes("__cg")));
+  assert.ok(Object.keys(raw.views).some((fid) => fid.includes("__raw__")));
+  assert.ok(
+    !Object.keys(raw.views).some((fid) => /^pr-1__\d+$/.test(fid)),
+    "grouped reviews do not ship unused plain-order views",
+  );
+  for (const view of Object.values(raw.views)) assert.ok(raw.files[view.f]);
+
+  // The Git-order view ships inside a <template>, so none of its file blocks
+  // are in the initial DOM.
+  const rawView =
+    /<div class="order-views" data-order-view="raw" hidden>\s*<template data-lazy-view>([\s\S]*?)<\/template>\s*<\/div>/.exec(
+      html,
+    );
+  assert.ok(rawView, "raw order view is an inert template");
+  assert.match(rawView[1], /data-view-key="raw::src\/alpha\.js"/);
+  assert.equal(
+    (html.match(/data-view-key="raw::/g) || []).length,
+    2,
+    "raw blocks only exist inside the template",
+  );
+  assert.match(html, /function materializeViews\(sec\)/);
+  assert.match(html, /mountShown/);
+  assert.doesNotMatch(html, /data-code=|data-fingerprint=|data-lineno=/);
 });

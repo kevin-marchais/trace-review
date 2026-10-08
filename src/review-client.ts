@@ -19,6 +19,15 @@ import {
   shortcutAction,
 } from "./review-helpers.js";
 import {
+  createReviewData,
+  ensureFingerprints,
+  rowKey,
+  type ClientFile,
+  type ClientHunk,
+  type ClientRow,
+  type EmbeddedReviewData,
+} from "./review-data.js";
+import {
   filterNavigationItems,
   findingsWithinNavigationLines,
   firstNavigationLineMatch,
@@ -66,44 +75,6 @@ declare global {
       ): { value: string };
     };
   }
-}
-
-interface ClientRow {
-  t: "a" | "d" | "c";
-  h: string;
-  c: string;
-  o?: number;
-  n?: number;
-  f: string;
-  cf: string;
-  _hl?: string;
-}
-
-interface ClientHunk {
-  header: string;
-  rows: ClientRow[];
-}
-
-interface ClientFile {
-  path: string;
-  oldPath: string;
-  renamed: boolean;
-  isNew: boolean;
-  isDeleted: boolean;
-  binary: boolean;
-  add: number;
-  del: number;
-  lang: string;
-  hunks: ClientHunk[];
-  reviewTarget: string;
-  fingerprint: string;
-  note?: string;
-  fullFile: {
-    revision: "head" | "base";
-    content?: string;
-    unavailable?: "binary" | "too-large" | "missing";
-    svgPreview?: string;
-  };
 }
 
 interface SplitPair {
@@ -225,7 +196,6 @@ interface MarkdownFile {
   lines: StoredLineComment[];
 }
 
-type ClientData = Record<string, ClientFile>;
 type ReviewData = Record<string, AutomatedReview>;
 type GithubData = Record<string, GithubPublicationContext>;
 
@@ -244,7 +214,7 @@ function eventElement(event: Event): UiElement | null {
   const MODE_KEY = "htmlreview:diffmode";
   const TITLE = document.querySelector(".app-header h1").textContent;
   const SUBTITLE = document.querySelector(".app-header .subtitle").textContent;
-  const DATA = parseEmbeddedJson<ClientData>("review-data");
+  const DATA = createReviewData(parseEmbeddedJson<Partial<EmbeddedReviewData>>("review-data"));
   const REVIEW = parseEmbeddedJson<ReviewData>("ai-review-data");
   const GITHUB = parseEmbeddedJson<GithubData>("github-review-data");
   const HAS_REVIEW = Object.keys(REVIEW).length > 0;
@@ -304,24 +274,19 @@ function eventElement(event: Event): UiElement | null {
       code.classList.add("hljs");
     });
   }
-  function applyWordDiffMarkup(highlightedHtml: string, wordDiffHtml: string): string {
-    if (!wordDiffHtml.includes('class="wd"')) return highlightedHtml;
-    const diffTemplate = document.createElement("template") as HTMLTemplateElement;
-    diffTemplate.innerHTML = wordDiffHtml;
+  // Wrap the changed-token ranges (offsets into the line text) of a word
+  // diff around the already highlighted HTML of that line.
+  function applyWordDiffMarkup(
+    highlightedHtml: string,
+    ranges: readonly number[] | undefined,
+    textLength: number,
+  ): string {
+    if (!ranges?.length) return highlightedHtml;
     const changedRanges: Array<{ start: number; end: number }> = [];
-    let diffOffset = 0;
-    const diffWalker = document.createTreeWalker(diffTemplate.content, NodeFilter.SHOW_TEXT);
-    let diffNode: Node | null;
-    while ((diffNode = diffWalker.nextNode())) {
-      const length = diffNode.textContent?.length || 0;
-      if ((diffNode.parentElement as Element | null)?.closest(".wd")) {
-        const previous = changedRanges[changedRanges.length - 1];
-        if (previous?.end === diffOffset) previous.end += length;
-        else changedRanges.push({ start: diffOffset, end: diffOffset + length });
-      }
-      diffOffset += length;
+    for (let index = 0; index + 1 < ranges.length; index += 2) {
+      changedRanges.push({ start: ranges[index], end: ranges[index + 1] });
     }
-    if (!changedRanges.length) return highlightedHtml;
+    const diffOffset = textLength;
 
     const syntaxTemplate = document.createElement("template") as HTMLTemplateElement;
     syntaxTemplate.innerHTML = highlightedHtml;
@@ -363,8 +328,13 @@ function eventElement(event: Event): UiElement | null {
     }
     return syntaxTemplate.innerHTML;
   }
-  // annotate each row in a hunk with its highlighted HTML (r._hl)
-  function annotateHl(h: ClientHunk, lang: string): void {
+  // Annotate each row of a hunk with its highlighted HTML (r._hl). Filtered
+  // hunks share row objects with their unfiltered hunk, which is highlighted
+  // once as a whole so every view gets the same, fully contextual colouring.
+  function annotateHl(hunk: ClientHunk, lang: string): void {
+    const h = hunk.base || hunk;
+    if (h.highlighted) return;
+    h.highlighted = true;
     const newHl = hlLines(
       h.rows
         .filter((r) => r.t !== "d")
@@ -388,7 +358,7 @@ function eventElement(event: Event): UiElement | null {
         r._hl = newHl[ni++];
         oi++;
       }
-      if (r.t !== "c") r._hl = applyWordDiffMarkup(r._hl, r.h);
+      if (r.t !== "c") r._hl = applyWordDiffMarkup(r._hl, r.w, r.c.length);
     }
   }
   // Saving can fail (quota exceeded by pasted images, storage disabled). Say so
@@ -571,54 +541,46 @@ function eventElement(event: Event): UiElement | null {
   });
 
   // ---- diff table builders (client-side, per mode) ----
-  function gutter(
-    file: string,
-    key: string,
-    lineno: number | undefined,
-    c: string,
-    lineFingerprint?: string,
-    contentFingerprint?: string,
-    diffFingerprint?: string,
-  ): string {
-    return `<td class="gutter" data-file="${escAttr(file)}" data-key="${escAttr(key)}" data-lineno="${lineno}" data-code="${escAttr(c)}" data-fingerprint="${escAttr(lineFingerprint || "")}" data-content-fingerprint="${escAttr(contentFingerprint || "")}" data-diff-fingerprint="${escAttr(diffFingerprint || "")}" title="Comment">+</td>`;
+  // Gutters carry only their anchor; code and fingerprints are read from the
+  // embedded row (rowFor) instead of being copied into every cell.
+  function gutter(file: string, key: string): string {
+    return `<td class="gutter" data-file="${escAttr(file)}" data-key="${escAttr(key)}" title="Comment">+</td>`;
+  }
+  const linenoOf = (g: UiElement): string => (g.dataset.key || "").replace(/^o/, "");
+  const rowIndexes = new WeakMap<ClientFile, Map<string, ClientRow>>();
+  function rowsByKey(fd: ClientFile): Map<string, ClientRow> {
+    let index = rowIndexes.get(fd);
+    if (!index) {
+      index = new Map();
+      for (const hunk of fd.hunks) for (const row of hunk.rows) index.set(rowKey(row), row);
+      rowIndexes.set(fd, index);
+    }
+    return index;
+  }
+  // The stored (unfiltered) file of a view, with its fingerprints filled.
+  function storedFile(fd: ClientFile): ClientFile {
+    const file = DATA.file(fd.index) || fd;
+    ensureFingerprints(file);
+    return file;
+  }
+  function mountFile(element: Element): ClientFile | undefined {
+    return DATA.view(element.closest(".diff-mount")?.dataset.fid);
+  }
+  function rowFor(g: UiElement): ClientRow | undefined {
+    const fd = mountFile(g);
+    if (!fd) return undefined;
+    storedFile(fd);
+    return rowsByKey(fd).get(g.dataset.key || "");
   }
   // Group views keep only some rows of a hunk; say so instead of letting the
   // line numbers jump silently.
   function gapRow(skipped: number, columns: number): string {
     return `<tr class="line-gap"><td colspan="${columns}">⋯ ${skipped} line${skipped === 1 ? "" : "s"} in other groups</td></tr>`;
   }
-  // The unfiltered version of a file (the copy with the most rows) tells a
-  // group view exactly which rows of each hunk it does not show.
-  const unfilteredFiles = new Map<string, ClientFile | null>();
-  function unfilteredFile(fd: ClientFile): ClientFile | null {
-    const key = fd.reviewTarget + " " + fd.path;
-    if (!unfilteredFiles.has(key)) {
-      let best: ClientFile | null = null;
-      let bestRows = -1;
-      for (const candidate of Object.values(DATA)) {
-        if (candidate.reviewTarget !== fd.reviewTarget || candidate.path !== fd.path) continue;
-        const rows = candidate.hunks.reduce((sum, hunk) => sum + hunk.rows.length, 0);
-        if (rows > bestRows) {
-          best = candidate;
-          bestRows = rows;
-        }
-      }
-      unfilteredFiles.set(key, best);
-    }
-    return unfilteredFiles.get(key) ?? null;
-  }
-  function gapsFor(fd: ClientFile, h: ClientHunk): HunkGaps {
-    const source = unfilteredFile(fd);
-    const first = h.rows[0];
-    const original =
-      source && source !== fd && first
-        ? source.hunks.find((candidate) =>
-            candidate.rows.some(
-              (row) => row.t === first.t && row.o === first.o && row.n === first.n,
-            ),
-          )?.rows
-        : undefined;
-    return hunkGaps(h.rows, original);
+  // A filtered hunk knows its unfiltered hunk, which tells a group view
+  // exactly which rows it does not show.
+  function gapsFor(h: ClientHunk): HunkGaps {
+    return hunkGaps(h.rows, h.base?.rows);
   }
   function unifiedTable(fd: ClientFile): string {
     let b = "";
@@ -628,19 +590,18 @@ function eventElement(event: Event): UiElement | null {
       for (const h of fd.hunks) {
         annotateHl(h, fd.lang);
         b += `<tr class="line line-hunk"><td class="ln"></td><td class="ln"></td><td class="gutter empty"></td><td class="code">@@ ${escAttr(h.header)}</td></tr>`;
-        const gaps = gapsFor(fd, h);
+        const gaps = gapsFor(h);
         for (const [index, r] of h.rows.entries()) {
           const skipped = gaps.before.get(index);
           if (skipped) b += gapRow(skipped, 4);
           const cls = r.t === "a" ? "line-add" : r.t === "d" ? "line-del" : "line-ctx";
           const marker = r.t === "a" ? "+" : r.t === "d" ? "-" : " ";
-          const key = r.t === "d" ? "o" + r.o : String(r.n);
-          const lineno = r.t === "d" ? r.o : r.n;
+          const key = rowKey(r);
           b +=
             `<tr class="line ${cls}">` +
             `<td class="ln ln-old">${r.t !== "a" && r.o != null ? r.o : ""}</td>` +
             `<td class="ln ln-new">${r.t !== "d" && r.n != null ? r.n : ""}</td>` +
-            gutter(fd.path, key, lineno, r.c, r.f, r.cf, fd.fingerprint) +
+            gutter(fd.path, key) +
             `<td class="code"><span class="marker">${marker}</span>${r._hl}</td>` +
             `</tr>`;
         }
@@ -683,7 +644,7 @@ function eventElement(event: Event): UiElement | null {
       for (const h of fd.hunks) {
         annotateHl(h, fd.lang);
         b += `<tr class="line line-hunk"><td class="ln"></td><td class="code" colspan="5">@@ ${escAttr(h.header)}</td></tr>`;
-        for (const p of splitPairs(h, gapsFor(fd, h))) {
+        for (const p of splitPairs(h, gapsFor(h))) {
           if (p.gap) {
             b += gapRow(p.gap, 6);
             continue;
@@ -695,7 +656,7 @@ function eventElement(event: Event): UiElement | null {
           } else if (p.l) {
             b +=
               `<td class="ln ln-old">${p.l.o != null ? p.l.o : ""}</td>` +
-              gutter(fd.path, "o" + p.l.o, p.l.o, p.l.c, p.l.f, p.l.cf, fd.fingerprint) +
+              gutter(fd.path, "o" + p.l.o) +
               `<td class="code line-del">${p.l._hl}</td>`;
           } else {
             b += `<td class="ln"></td><td class="gutter empty"></td><td class="code empty"></td>`;
@@ -704,12 +665,12 @@ function eventElement(event: Event): UiElement | null {
           if (p.ctx && p.l && p.r) {
             b +=
               `<td class="ln ln-new">${p.r.n != null ? p.r.n : ""}</td>` +
-              gutter(fd.path, String(p.r.n), p.r.n, p.r.c, p.r.f, p.r.cf, fd.fingerprint) +
+              gutter(fd.path, String(p.r.n)) +
               `<td class="code line-ctx">${p.r._hl}</td>`;
           } else if (p.r) {
             b +=
               `<td class="ln ln-new">${p.r.n != null ? p.r.n : ""}</td>` +
-              gutter(fd.path, String(p.r.n), p.r.n, p.r.c, p.r.f, p.r.cf, fd.fingerprint) +
+              gutter(fd.path, String(p.r.n)) +
               `<td class="code line-add">${p.r._hl}</td>`;
           } else {
             b += `<td class="ln"></td><td class="gutter empty"></td><td class="code empty"></td>`;
@@ -744,7 +705,7 @@ function eventElement(event: Event): UiElement | null {
     const meta = document.createElement("div");
     meta.className = "cb-meta";
     const location = document.createElement("span");
-    const endLine = parseInt(g.dataset.lineno || "", 10);
+    const endLine = parseInt(linenoOf(g), 10);
     const oldSide = key.startsWith("o");
     const candidates = new Map<string, string>();
     const candidateFingerprints = new Map<string, string>();
@@ -758,7 +719,7 @@ function eventElement(event: Event): UiElement | null {
         .querySelectorAll('.gutter[data-file="' + cssEsc(file) + '"][data-key]')
         .forEach((candidate) => {
           const candidateKey = candidate.dataset.key || "";
-          const candidateLine = parseInt(candidate.dataset.lineno || "", 10);
+          const candidateLine = parseInt(linenoOf(candidate), 10);
           if (
             candidateKey &&
             candidateKey.startsWith("o") === oldSide &&
@@ -766,7 +727,7 @@ function eventElement(event: Event): UiElement | null {
             candidateLine <= endLine
           ) {
             candidates.set(candidateKey, String(candidateLine));
-            candidateFingerprints.set(candidateKey, candidate.dataset.fingerprint || "");
+            candidateFingerprints.set(candidateKey, rowFor(candidate)?.f || "");
           }
         });
       candidateRow = candidateRow.previousElementSibling;
@@ -820,20 +781,22 @@ function eventElement(event: Event): UiElement | null {
       anchorRow = anchorRow.nextElementSibling;
     }
     anchorRow.after(crow);
+    const row = rowFor(g);
+    const fd = mountFile(g);
     const store = () => {
       state.lines[id] = {
         pr,
         file,
         key,
         startKey: startSelect.value,
-        lineno: g.dataset.lineno,
-        startLineno: candidates.get(startSelect.value) || g.dataset.lineno,
-        code: g.dataset.code,
+        lineno: linenoOf(g),
+        startLineno: candidates.get(startSelect.value) || linenoOf(g),
+        code: row?.c,
         text: ta.value,
-        fingerprint: g.dataset.fingerprint || "",
-        contentFingerprint: g.dataset.contentFingerprint || "",
+        fingerprint: row?.f || "",
+        contentFingerprint: row?.cf || "",
         startFingerprint: candidateFingerprints.get(startSelect.value) || "",
-        diffFingerprint: g.dataset.diffFingerprint || "",
+        diffFingerprint: (fd && storedFile(fd).fingerprint) || "",
       };
       save();
       updateCounts();
@@ -867,36 +830,33 @@ function eventElement(event: Event): UiElement | null {
     if (prefill && !saved) store();
     return ta;
   }
+  // Re-anchor saved comments on this mount's rows: by line fingerprint, then
+  // by a content fingerprint that is unique in the file, then (comments saved
+  // without fingerprints) by line key.
   function applyComments(mount: UiElement): void {
     const pr = mount.closest("section.pr").dataset.pr;
+    const fd = DATA.view(mount.dataset.fid);
+    if (!fd) return;
+    const diffFingerprint = storedFile(fd).fingerprint || "";
+    const rows = fd.hunks.flatMap((hunk) => hunk.rows);
     // Re-anchoring may touch many comments; persist once at the end.
     let dirty = false;
     for (const id in state.lines) {
       const c = state.lines[id];
-      if (!c || c.pr !== pr) continue;
-      const fingerprintSelector = c.fingerprint
-        ? '.gutter[data-fingerprint="' +
-          cssEsc(c.fingerprint) +
-          '"][data-file="' +
-          cssEsc(c.file) +
-          '"]'
-        : "";
-      const contentSelector =
-        c.contentFingerprint && uniqueContentFingerprint(c.pr, c.file, c.contentFingerprint)
-          ? '.gutter[data-content-fingerprint="' +
-            cssEsc(c.contentFingerprint) +
-            '"][data-file="' +
-            cssEsc(c.file) +
-            '"]'
-          : "";
-      const g =
-        (fingerprintSelector && mount.querySelector(fingerprintSelector)) ||
-        (contentSelector && mount.querySelector(contentSelector)) ||
-        (!c.fingerprint &&
-          mount.querySelector(
-            '.gutter[data-key="' + cssEsc(c.key) + '"][data-file="' + cssEsc(c.file) + '"]',
-          ));
-      if (g) {
+      if (!c || c.pr !== pr || c.file !== fd.path) continue;
+      const row =
+        (c.fingerprint && rows.find((candidate) => candidate.f === c.fingerprint)) ||
+        (c.contentFingerprint &&
+          uniqueContentFingerprint(c.pr, c.file, c.contentFingerprint) &&
+          rows.find((candidate) => candidate.cf === c.contentFingerprint)) ||
+        (!c.fingerprint && rows.find((candidate) => rowKey(candidate) === c.key)) ||
+        undefined;
+      const g = row
+        ? mount.querySelector(
+            '.gutter[data-key="' + cssEsc(rowKey(row)) + '"][data-file="' + cssEsc(c.file) + '"]',
+          )
+        : null;
+      if (row && g) {
         const rangePrefix = c.pr + "\0" + c.file + "\0";
         if (
           c.startKey &&
@@ -904,12 +864,13 @@ function eventElement(event: Event): UiElement | null {
           (c.rangeStale ||
             !rangeStartMatchesAnchor(
               c.startFingerprint,
-              lineEvidence().anchorFingerprints.get(rangePrefix + c.startKey),
+              lineEvidence(c.pr, c.file).anchorFingerprints.get(rangePrefix + c.startKey),
             ))
         ) {
           continue;
         }
-        const currentId = uid(pr, c.file, g.dataset.key);
+        const currentKey = rowKey(row);
+        const currentId = uid(pr, c.file, currentKey);
         const oldKey = c.key;
         if (id !== currentId) {
           if (c.startKey && c.startKey !== oldKey) {
@@ -918,26 +879,25 @@ function eventElement(event: Event): UiElement | null {
             continue;
           }
           const oldAttachmentId = attachmentId("line", c.pr, c.file, c.key);
-          const newAttachmentId = attachmentId("line", pr, c.file, g.dataset.key);
+          const newAttachmentId = attachmentId("line", pr, c.file, currentKey);
           if (state.attachments[oldAttachmentId]) {
             state.attachments[newAttachmentId] = state.attachments[oldAttachmentId];
             delete state.attachments[oldAttachmentId];
           }
           delete state.lines[id];
-          c.key = g.dataset.key;
-          c.lineno = g.dataset.lineno;
+          c.key = currentKey;
+          c.lineno = linenoOf(g);
           if (!c.startKey || c.startKey === oldKey) {
-            c.startKey = g.dataset.key;
-            c.startLineno = g.dataset.lineno;
+            c.startKey = currentKey;
+            c.startLineno = linenoOf(g);
           }
-          c.code = g.dataset.code;
-          c.diffFingerprint = g.dataset.diffFingerprint || "";
+          c.code = row.c;
+          c.diffFingerprint = diffFingerprint;
           state.lines[currentId] = c;
           dirty = true;
         }
-        const fingerprint = g.dataset.fingerprint || "";
-        const contentFingerprint = g.dataset.contentFingerprint || "";
-        const diffFingerprint = g.dataset.diffFingerprint || "";
+        const fingerprint = row.f || "";
+        const contentFingerprint = row.cf || "";
         if (
           c.fingerprint !== fingerprint ||
           c.contentFingerprint !== contentFingerprint ||
@@ -954,21 +914,26 @@ function eventElement(event: Event): UiElement | null {
     if (dirty) save();
   }
 
-  let lineEvidenceCache: LineEvidence | null = null;
-  function lineEvidence(): LineEvidence {
-    if (lineEvidenceCache) return lineEvidenceCache;
+  // Per-file anchors and fingerprints. Keys are prefixed with
+  // pr + "\0" + file + "\0" so the lookups read like a global index, but only
+  // files that actually carry comments are ever fingerprinted.
+  const lineEvidenceCache = new Map<string, LineEvidence>();
+  function lineEvidence(pr: string, file: string): LineEvidence {
+    const prefix = pr + "\0" + file + "\0";
+    const cached = lineEvidenceCache.get(prefix);
+    if (cached) return cached;
     const fingerprints = new Set<string>(),
       anchors = new Set<string>(),
       anchorFingerprints = new Map<string, string>(),
       content = new Map<string, Set<string>>();
-    Object.values(DATA).forEach((file) => {
-      (file.hunks || []).forEach((hunk) =>
-        (hunk.rows || []).forEach((row) => {
-          const prefix = file.reviewTarget + "\0" + file.path + "\0";
-          const key = row.t === "d" ? "o" + row.o : String(row.n);
+    DATA.filesFor(pr, file).forEach((stored) => {
+      ensureFingerprints(stored);
+      stored.hunks.forEach((hunk) =>
+        hunk.rows.forEach((row) => {
+          const key = rowKey(row);
           if (row.f) fingerprints.add(prefix + row.f);
           anchors.add(prefix + key);
-          anchorFingerprints.set(prefix + key, row.f);
+          anchorFingerprints.set(prefix + key, row.f || "");
           if (row.cf) {
             const contentKey = prefix + row.cf;
             const matches = content.get(contentKey) ?? new Set<string>();
@@ -978,37 +943,48 @@ function eventElement(event: Event): UiElement | null {
         }),
       );
     });
-    lineEvidenceCache = { fingerprints, anchors, anchorFingerprints, content };
-    return lineEvidenceCache;
+    const evidence = { fingerprints, anchors, anchorFingerprints, content };
+    lineEvidenceCache.set(prefix, evidence);
+    return evidence;
   }
-  function currentLineFingerprints(): Set<string> {
-    return lineEvidence().fingerprints;
-  }
-  function currentLineAnchors(): Set<string> {
-    return lineEvidence().anchors;
+  // Anchors alone need no hashing, so findings can be checked cheaply.
+  const anchorCache = new Map<string, Set<string>>();
+  function lineAnchors(pr: string, file: string): Set<string> {
+    const prefix = pr + "\0" + file;
+    let anchors = anchorCache.get(prefix);
+    if (!anchors) {
+      anchors = new Set(
+        DATA.filesFor(pr, file).flatMap((stored) =>
+          stored.hunks.flatMap((hunk) => hunk.rows.map(rowKey)),
+        ),
+      );
+      anchorCache.set(prefix, anchors);
+    }
+    return anchors;
   }
   function uniqueContentFingerprint(pr: string, file: string, contentFingerprint: string): boolean {
-    return lineEvidence().content.get(pr + "\0" + file + "\0" + contentFingerprint)?.size === 1;
+    return (
+      lineEvidence(pr, file).content.get(pr + "\0" + file + "\0" + contentFingerprint)?.size === 1
+    );
   }
   function orphanedComments(): Array<[string, StoredLineComment]> {
-    const current = currentLineFingerprints(),
-      anchors = currentLineAnchors();
     return Object.entries(state.lines).filter(([, comment]) => {
       if (!comment) return false;
       const prefix = comment.pr + "\0" + comment.file + "\0";
+      const evidence = lineEvidence(comment.pr, comment.file);
       if (
         comment.startKey &&
         comment.startKey !== comment.key &&
         (comment.rangeStale ||
           !rangeStartMatchesAnchor(
             comment.startFingerprint,
-            lineEvidence().anchorFingerprints.get(prefix + comment.startKey),
+            evidence.anchorFingerprints.get(prefix + comment.startKey),
           ))
       ) {
         return true;
       }
-      if (!comment.fingerprint) return !anchors.has(prefix + comment.key);
-      if (current.has(prefix + comment.fingerprint)) return false;
+      if (!comment.fingerprint) return !evidence.anchors.has(prefix + comment.key);
+      if (evidence.fingerprints.has(prefix + comment.fingerprint)) return false;
       return !(
         comment.contentFingerprint &&
         uniqueContentFingerprint(comment.pr, comment.file, comment.contentFingerprint)
@@ -1081,7 +1057,7 @@ function eventElement(event: Event): UiElement | null {
       .join(" + ");
   }
   function findingAnchored(pr: string, finding: AutomatedFinding): boolean {
-    return currentLineAnchors().has(pr + "\0" + finding.file + "\0" + finding.key);
+    return lineAnchors(pr, finding.file).has(finding.key);
   }
   const findingRowRefreshers = new Map<string, Set<() => void>>();
   function lineCommentChanged(id: string): void {
@@ -1199,7 +1175,7 @@ function eventElement(event: Event): UiElement | null {
   let renderGeneration = 0;
   let mountObserver: IntersectionObserver | null = null;
   function renderMount(mnt: UiElement, mode: "unified" | "split"): void {
-    const fd = DATA[mnt.dataset.fid];
+    const fd = DATA.view(mnt.dataset.fid);
     if (!fd) return;
     mnt.innerHTML = mode === "split" ? splitTable(fd) : unifiedTable(fd);
     mnt.classList.remove("pending");
@@ -1222,15 +1198,23 @@ function eventElement(event: Event): UiElement | null {
     if (typeof requestIdleCallback === "function") requestIdleCallback(callback, { timeout: 120 });
     else setTimeout(() => callback(null), 16);
   };
-  function renderAll(mode: "unified" | "split"): void {
+  // Hidden order views and hidden PR tabs are not rendered until shown.
+  const mountShown = (mount: UiElement): boolean =>
+    !mount.closest("[data-order-view][hidden], section.pr[hidden]");
+  // `reset` (a diff-mode change) clears every mount; otherwise only shown
+  // mounts that are not yet rendered in this mode are scheduled.
+  function renderAll(mode: "unified" | "split", reset = true): void {
     const generation = ++renderGeneration;
     mountObserver?.disconnect();
-    const mounts = [...document.querySelectorAll(".diff-mount")];
-    mounts.forEach((mnt) => {
-      mnt.innerHTML = "";
-      delete mnt.dataset.rendered;
-      mnt.classList.add("pending");
-    });
+    const all = [...document.querySelectorAll(".diff-mount")];
+    if (reset) {
+      all.forEach((mnt) => {
+        mnt.innerHTML = "";
+        delete mnt.dataset.rendered;
+        mnt.classList.add("pending");
+      });
+    }
+    const mounts = all.filter((mnt) => mnt.dataset.rendered !== mode && mountShown(mnt));
     const pending = new Set(mounts);
     const priority: UiElement[] = [];
     let cursor = 0;
@@ -1626,8 +1610,8 @@ function eventElement(event: Event): UiElement | null {
       const tableRow = gutter.closest("tr");
       const codeCell = gutter.nextElementSibling;
       return {
-        line: gutter.dataset.lineno || gutter.dataset.key || "",
-        code: gutter.dataset.code || "",
+        line: linenoOf(gutter) || gutter.dataset.key || "",
+        code: rowFor(gutter)?.c || "",
         kind:
           tableRow.classList.contains("line-add") || codeCell?.classList.contains("line-add")
             ? ("add" as const)
@@ -1898,7 +1882,7 @@ function eventElement(event: Event): UiElement | null {
       for (const row of selectedExportRows(selection)) {
         const cells = [...row.children] as UiElement[];
         const gutter = cells[2];
-        const code = gutter?.dataset.code || "";
+        const code = (gutter && rowFor(gutter)?.c) || "";
         if (row.classList.contains("line-del")) {
           deleted.push({ line: cells[0]?.textContent || "", code, kind: "del" });
         } else if (row.classList.contains("line-add")) {
@@ -1914,7 +1898,7 @@ function eventElement(event: Event): UiElement | null {
       flush();
     }
 
-    const lang = Object.values(DATA).find((file) => file.path === selection.file)?.lang || "";
+    const lang = mountFile(selection.start)?.lang || "";
     const oldHighlights = hlLines(rows.map((row) => row.old?.code || "").join("\n"), lang);
     const newHighlights = hlLines(rows.map((row) => row.next?.code || "").join("\n"), lang);
     rows.forEach((row, index) => {
@@ -2547,12 +2531,12 @@ function eventElement(event: Event): UiElement | null {
   });
 
   // ---- file collapse (ignore clicks on the action controls) ----
-  document.querySelectorAll(".file-header").forEach((h) => {
+  function bindFileCollapse(h: UiElement): void {
     h.addEventListener("click", (e) => {
       if (eventElement(e)?.closest(".file-actions")) return;
       h.closest(".file").classList.toggle("collapsed");
     });
-  });
+  }
 
   // ---- whole-file viewer ----
   const fileModal = document.getElementById("fileModal");
@@ -2581,17 +2565,18 @@ function eventElement(event: Event): UiElement | null {
         selectFileView(button.dataset.fileView === "image" ? "image" : "code"),
       ),
     );
-  document.querySelectorAll(".view-file-btn").forEach((button) => {
+  function bindViewFileButton(button: UiElement): void {
     // Nothing to show without embedded file content, so do not offer it.
     const contentFid = button.closest(".file")?.querySelector(".diff-mount")?.dataset.fid;
-    if (!contentFid || typeof DATA[contentFid]?.fullFile?.content !== "string") {
+    if (!contentFid || typeof DATA.view(contentFid)?.fullFile?.content !== "string") {
       button.hidden = true;
       return;
     }
     button.addEventListener("click", () => {
       const fileEl = button.closest(".file");
       const fid = fileEl.querySelector(".diff-mount").dataset.fid;
-      const file = DATA[fid];
+      const file = DATA.view(fid);
+      if (!file) return;
       fileModalTitle.textContent = file.path;
       fileModalMeta.textContent =
         file.fullFile.revision === "base" ? "File before deletion" : "File after these changes";
@@ -2633,7 +2618,7 @@ function eventElement(event: Event): UiElement | null {
       }
       openDialog(fileModal, document.getElementById("closeFileModal"));
     });
-  });
+  }
   document.getElementById("closeFileModal").addEventListener("click", closeFileModal);
   fileModal.addEventListener("click", (event) => {
     if (event.target === fileModal) closeFileModal();
@@ -2715,14 +2700,19 @@ function eventElement(event: Event): UiElement | null {
       (candidate) => candidate.dataset.file === file,
     );
   }
+  // The Git-order view may not be materialized yet, so its viewed state is
+  // stored by key rather than through its elements.
+  const rawViewedId = (sec: UiElement, file: string): string => sec.dataset.pr + " raw::" + file;
+  const hasRawView = (sec: UiElement): boolean => !!sec.querySelector('[data-order-view="raw"]');
   function syncRawViewed(sec: UiElement, file: string, persist: boolean): void {
     const grouped = groupedOccurrences(sec, file),
       viewed =
         grouped.length > 0 && grouped.every((candidate) => candidate.classList.contains("viewed"));
-    rawOccurrences(sec, file).forEach((candidate) => {
-      applyViewed(candidate, viewed);
-      if (persist) storeViewed(candidate, viewed);
-    });
+    rawOccurrences(sec, file).forEach((candidate) => applyViewed(candidate, viewed));
+    if (persist && hasRawView(sec)) {
+      if (viewed) state.viewed[rawViewedId(sec, file)] = true;
+      else delete state.viewed[rawViewedId(sec, file)];
+    }
   }
   function setViewed(fileEl: UiElement, viewed: boolean, persist: boolean): void {
     const sec = fileEl.closest("section.pr"),
@@ -2791,15 +2781,24 @@ function eventElement(event: Event): UiElement | null {
       const scoped = groupedOccurrences(sec, file).filter((candidate) => candidate.dataset.viewKey);
       if (!scoped.length) return;
       scoped.forEach((candidate) => storeViewed(candidate, true));
-      rawOccurrences(sec, file).forEach((candidate) => storeViewed(candidate, true));
+      if (hasRawView(sec)) state.viewed[rawViewedId(sec, file)] = true;
       delete state.viewed[legacyId];
       migratedViewedState = true;
     });
   });
   if (migratedViewedState) save();
-  document.querySelectorAll(".file").forEach((fileEl) => {
+  // Wire one file block. Blocks of a lazily materialized view take their
+  // viewed state from the grouped view instead of their own stored key.
+  function initFileElement(fileEl: UiElement, applyStoredViewed: boolean): void {
     const pr = fileEl.closest("section.pr").dataset.pr,
       id = viewedId(fileEl);
+    const header = fileEl.querySelector(":scope > .file-header");
+    if (header) bindFileCollapse(header);
+    const viewButton = fileEl.querySelector(".view-file-btn");
+    if (viewButton) bindViewFileButton(viewButton);
+    const pathToggle = fileEl.querySelector(":scope > .file-header .file-path");
+    if (pathToggle) bindHeaderToggle(pathToggle);
+    syncExpanded(fileEl);
     const fileNoteId = pr + " " + fileEl.dataset.file;
     const fileAttachId = attachmentId("file", pr, fileEl.dataset.file, "");
     const btn = fileEl.querySelector(".file-note-btn");
@@ -2818,13 +2817,47 @@ function eventElement(event: Event): UiElement | null {
       fileNoteBox(fileEl, state.files[fileNoteId].text, false);
       if (btn) btn.classList.add("has-note");
     }
-    if (state.viewed[id]) setViewed(fileEl, true, false);
-  });
+    if (applyStoredViewed && state.viewed[id]) setViewed(fileEl, true, false);
+  }
+  document.querySelectorAll(".file").forEach((fileEl) => initFileElement(fileEl, true));
   document.querySelectorAll("section.pr").forEach((sec) => {
+    // A file marked viewed in Git order counts as viewed in every group.
+    if (sec.querySelector("template[data-lazy-view]")) {
+      new Set(
+        [...sec.querySelectorAll('[data-order-view="grouped"] .file')].map(
+          (file) => file.dataset.file,
+        ),
+      ).forEach((file) => {
+        if (!state.viewed[rawViewedId(sec, file)]) return;
+        const related = groupedOccurrences(sec, file);
+        related.forEach((candidate) => applyViewed(candidate, true));
+        new Set(related.map((candidate) => candidate.closest(".group")).filter(Boolean)).forEach(
+          syncGroupCb,
+        );
+      });
+    }
     new Set([...sec.querySelectorAll(".file")].map((file) => file.dataset.file)).forEach((file) =>
       syncRawViewed(sec, file, false),
     );
   });
+  // Materialize the shown order views of a section that still ship as
+  // inert <template>s, then wire their file blocks.
+  function materializeViews(sec: UiElement): void {
+    sec
+      .querySelectorAll("[data-order-view]:not([hidden]) > template[data-lazy-view]")
+      .forEach((template) => {
+        const view = template.parentElement as UiElement;
+        const content = (template as unknown as HTMLTemplateElement).content;
+        template.remove();
+        view.append(content);
+        const files = [...view.querySelectorAll(".file")];
+        files.forEach((fileEl) => initFileElement(fileEl, false));
+        new Set(files.map((file) => file.dataset.file)).forEach((file) =>
+          syncRawViewed(sec, file, false),
+        );
+        updateCounts();
+      });
+  }
 
   // ---- change groups: collapse + one "Reviewed" that clears the whole group ----
   document.querySelectorAll(".group-head").forEach((h) => {
@@ -2880,12 +2913,9 @@ function eventElement(event: Event): UiElement | null {
   function navigationLines(file: UiElement): Array<{ key: string; text: string }> {
     const id = file.querySelector(".diff-mount")?.dataset.fid;
     if (!id) return [];
-    return (DATA[id]?.hunks || [])
-      .flatMap((hunk) => hunk.rows || [])
-      .map((row) => ({
-        key: row.t === "d" ? "o" + row.o : String(row.n),
-        text: row.c,
-      }))
+    return (DATA.view(id)?.hunks || [])
+      .flatMap((hunk) => hunk.rows)
+      .map((row) => ({ key: rowKey(row), text: row.c }))
       .filter((line) => line.key !== "undefined");
   }
   function isTestPath(path: string): boolean {
@@ -3173,6 +3203,7 @@ function eventElement(event: Event): UiElement | null {
       document.querySelectorAll("section.pr").forEach((s) => {
         s.hidden = s.dataset.pr !== id;
       });
+      renderAll(mode, false);
       syncReviewJourney();
       window.scrollTo(0, 0);
       updateProgress();
@@ -3250,9 +3281,7 @@ function eventElement(event: Event): UiElement | null {
       .join("\n");
   }
   function fileLanguage(pr: string, file: string): string {
-    return (
-      Object.values(DATA).find((data) => data.reviewTarget === pr && data.path === file)?.lang || ""
-    );
+    return DATA.filesFor(pr, file)[0]?.lang || "";
   }
   // The full code of a range comment, read from the embedded diff rows.
   function commentRangeCode(comment: StoredLineComment): { code: string; lang: string } {
@@ -3261,8 +3290,7 @@ function eventElement(event: Event): UiElement | null {
     const end = parseInt(comment.lineno || "", 10);
     let best = new Map<number, string>();
     let lang = "";
-    for (const data of Object.values(DATA)) {
-      if (data.reviewTarget !== comment.pr || data.path !== comment.file) continue;
+    for (const data of DATA.filesFor(comment.pr, comment.file)) {
       const lines = new Map<number, string>();
       for (const hunk of data.hunks) {
         for (const row of hunk.rows) {
@@ -3583,6 +3611,8 @@ function eventElement(event: Event): UiElement | null {
     sec.querySelectorAll("[data-order-view]").forEach((view) => {
       view.hidden = view.dataset.orderView !== (raw ? "raw" : "grouped");
     });
+    materializeViews(sec);
+    renderAll(mode, false);
     const readingOrder = sec.querySelector(".reading-order");
     if (readingOrder) readingOrder.hidden = raw;
     refreshTree();
@@ -3843,24 +3873,24 @@ function eventElement(event: Event): UiElement | null {
     if (toggle)
       toggle.setAttribute("aria-expanded", String(!container.classList.contains("collapsed")));
   }
-  document
-    .querySelectorAll(".file-header .file-path, .group-head .group-title")
-    .forEach((toggle) => {
-      const label = toggle.textContent?.trim() || "";
-      toggle.setAttribute("role", "button");
-      toggle.setAttribute("tabindex", "0");
-      if (toggle.matches(".file-path")) {
-        toggle.title = label;
-        // isolate the path so narrow layouts can truncate it from the left
-        toggle.innerHTML = `<bdi>${escAttr(label)}</bdi>`;
-      }
-      toggle.addEventListener("keydown", (event) => {
-        if (event.key !== "Enter" && event.key !== " ") return;
-        event.preventDefault();
-        toggle.closest(".file-header, .group-head")?.click();
-      });
+  function bindHeaderToggle(toggle: UiElement): void {
+    const label = toggle.textContent?.trim() || "";
+    toggle.setAttribute("role", "button");
+    toggle.setAttribute("tabindex", "0");
+    if (toggle.matches(".file-path")) {
+      toggle.title = label;
+      // isolate the path so narrow layouts can truncate it from the left
+      toggle.innerHTML = `<bdi>${escAttr(label)}</bdi>`;
+    }
+    toggle.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      toggle.closest(".file-header, .group-head")?.click();
     });
-  document.querySelectorAll(".file, .group").forEach(syncExpanded);
+  }
+  // File blocks are wired by initFileElement.
+  document.querySelectorAll(".group-head .group-title").forEach(bindHeaderToggle);
+  document.querySelectorAll(".group").forEach(syncExpanded);
   new MutationObserver((records) => {
     for (const record of records) {
       const element = record.target as UiElement;
