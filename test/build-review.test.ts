@@ -428,7 +428,7 @@ test("LM-analysis fixture renders its global assessment and line finding", (t) =
   assert.match(html, /Document the compatibility contract/);
   assert.match(html, /Keep it implementation-defined/);
   assert.match(html, /Proposed change/);
-  assert.match(html, /state\.aiReply\[aiId\]/);
+  assert.match(html, /function findingReplied\(pr, finding\)/);
   assert.doesNotMatch(html, />✓ Accept</);
   assert.doesNotMatch(html, />✕ Dismiss</);
   assert.match(html, /class="findings-panel"/);
