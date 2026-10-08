@@ -12,6 +12,7 @@ export const SKILL_BUNDLE_SOURCE_FILES = Object.freeze([
   "docs/ADAPTIVE-DETECTORS.md",
   "docs/REAL-PR-METRICS.md",
   "docs/REPOSITORY-CONFIGURATION.md",
+  "docs/REVIEW-INTERFACE.md",
   "examples/diagram.svg",
   "examples/pr-1.groups.json",
   "examples/pr-1.patch",
@@ -19,6 +20,8 @@ export const SKILL_BUNDLE_SOURCE_FILES = Object.freeze([
 ]);
 
 export const SKILL_BUNDLE_RUNTIME_FILES = Object.freeze([
+  "schemas/detector-rules.v1.schema.json",
+  "schemas/review-result.v1.schema.json",
   "schemas/review-spec.v1.schema.json",
   "scripts/build-review.mjs",
   "scripts/collect-pr-context.mjs",
@@ -31,14 +34,21 @@ export const SKILL_BUNDLE_RUNTIME_FILES = Object.freeze([
   "scripts/trace-review.mjs",
   "scripts/validate-review-spec.mjs",
   "scripts/lib/cli.mjs",
+  "scripts/lib/cli-args.mjs",
   "scripts/lib/change-groups.mjs",
+  "scripts/lib/diagnostics.mjs",
   "scripts/lib/diff-parse.mjs",
   "scripts/lib/github-review.mjs",
+  "scripts/lib/json-schema.mjs",
+  "scripts/lib/llm.mjs",
   "scripts/lib/lm-analysis.mjs",
+  "scripts/lib/lm-bundle.mjs",
   "scripts/lib/lm-groups.mjs",
+  "scripts/lib/lm-loop.mjs",
   "scripts/lib/pr-context.mjs",
   "scripts/lib/preflight.mjs",
   "scripts/lib/repeated-changes.mjs",
+  "scripts/lib/review-result.mjs",
   "scripts/lib/review-spec.mjs",
   "templates/review.template.html",
 ]);

@@ -18,8 +18,8 @@ The language model does not generate the HTML document. It creates structured re
 local diff or pull request
   → prepare collects facts and the diff
   → automatic repeated-change discovery; optional adaptive refinement
-  → the LM writes one structured result
-  → finish validates it and builds a uniquely named review HTML from the template
+  → with --lm, an LLM CLI writes one structured result, validated and retried in-process
+  → finish builds a uniquely named review HTML from the template
 ```
 
 The result is a portable local page with light and dark themes, diff controls,
@@ -70,25 +70,45 @@ The installer selects the correct directory for the requested coding agent. As a
 
 ## Use
 
-From a source checkout, the quick command follows the common `git diff`
-revision forms:
+One command runs the whole pipeline. From a source checkout, the target
+follows the common `git diff` forms or names a pull request:
 
 ```bash
 bun trace-review                    # unstaged working-tree changes
+bun trace-review --cached           # staged changes (alias --staged)
 bun trace-review main               # main versus the working tree
 bun trace-review main feature       # two branches
 bun trace-review abc123 def456      # two commits
 bun trace-review main..feature      # two-dot range
 bun trace-review main...feature     # merge-base/three-dot range
+bun trace-review pr 42              # pull request (also #42 or its GitHub URL)
+bun trace-review main -- src docs   # limit a local diff to pathspecs
 ```
+
+Without `--lm` the review is deterministic and needs no model. Add `--lm` for
+language-model grouping and findings, or `--deep-audit` for a broader audit:
+
+```bash
+bun trace-review pr 42 --lm                          # claude, else codex, from PATH
+bun trace-review main..feature --lm --llm codex --model gpt-5
+bun trace-review --deep-audit --llm claude --max-retries 1
+bun trace-review pr 42 --lm --llm none               # prepare .review/lm/ for an agent
+```
+
+The command runs the CLI read-only (Claude Code with only `Read`, `Grep`, and
+`Glob`; Codex in its read-only sandbox), passes the result schema to it,
+validates the answer in-process, and re-prompts with structured diagnostics up
+to `--max-retries` times (default 2). Each attempt is kept in
+`.review/lm/attempt-N.json`, and timing, token, and cost figures go to
+`.review/run-metrics.json`. With `--llm none` it writes `.review/lm/`
+(`prompt.md`, `input.json`, `context.lm.patch`, `result.schema.json`) and
+prints the `finish` command to run once `.review/lm/result.json` exists.
 
 Every form writes its supporting files to `.review/`, lists existing HTML
 reviews, builds a target-based name such as
 `.review/review-main-feature.html`, and opens it. Existing files are never
 overwritten; a numeric suffix is selected atomically when needed. Add
-`--no-open` to generate the document without launching a browser. Quick mode
-accepts zero, one, or two revisions; Git flags such as `--cached` and pathspec
-filtering are not currently supported.
+`--no-open` to generate the document without launching a browser.
 
 The **Files** drawer searches file paths, diff content, and findings. Its
 combinable filters narrow the navigation list to unread files, open findings,
@@ -96,7 +116,7 @@ tests, generated files, severities, risks, or decision groups without changing
 review decisions. Search and filter state remains active when switching between
 grouped and Git order.
 
-The coding-agent workflow is also available:
+The skill maps the same requests to this command for coding agents:
 
 - `/trace-review` opens the workspace without automatic LM findings.
 - `/trace-review lm` or `/trace-review ai` adds focused LM findings.
@@ -108,7 +128,8 @@ The coding-agent workflow is also available:
 
 See the authored [skill instructions](SKILL.source.md), the
 [adaptive detector format](docs/ADAPTIVE-DETECTORS.md), the
-[review specification](REVIEW-SPEC.md), and the
+[review specification](REVIEW-SPEC.md), the
+[interface reference](docs/REVIEW-INTERFACE.md), and the
 [operational boundaries](docs/LIMITATIONS.md).
 
 ## Develop

@@ -34,14 +34,22 @@ test("release skill distribution is staged outside the source tree", (t) => {
 test("skill documents composable LM and pull-request shortcuts", () => {
   const skill = fs.readFileSync(path.join(root, "SKILL.source.md"), "utf8");
 
-  assert.match(skill, /`lm`, `ai`, and `lm-analysis` select LM analysis/);
-  assert.match(skill, /`pr <number>` and `pr #<number>` select that pull request/);
-  assert.match(skill, /`lm pr 8`, `pr 8 ai`, and `pr #8 lm`/);
-  assert.match(skill, /write `"mode": "lm-analysis"` and pass only\s+the number to `--pr`/);
-  assert.match(skill, /trace-review\.mjs prepare/);
+  assert.match(skill, /\| `lm`, `ai`, "with findings" \| add `--lm` \|/);
+  assert.match(skill, /`pr 8`, `pr #8`, a PR URL \| `trace-review\.mjs pr 8`/);
+  assert.match(skill, /`lm pr 8`, `pr 8 ai`, `pr #8 lm` \| `trace-review\.mjs pr 8 --lm`/);
+  assert.match(skill, /"deep audit" \(explicit request only\) \| add `--deep-audit`/);
+  assert.match(skill, /trace-review\.mjs pr 8 --lm --llm none/);
   assert.match(skill, /trace-review\.mjs finish/);
-  assert.match(skill, /If `prepare` succeeds, do not call the low-level scripts, `git`, or `gh`/);
-  assert.match(skill, /Write only `\.review\/review-result\.json`/);
+  assert.match(skill, /do not call `git`, `gh`, or the lower-level scripts/);
+  assert.match(skill, /write `\.review\/lm\/result\.json`/);
+  assert.ok(Buffer.byteLength(skill) < 9_000, "the skill stays near 2k tokens");
+});
+
+test("skill examples use the result contract consistently", () => {
+  const skill = fs.readFileSync(path.join(root, "SKILL.source.md"), "utf8");
+  assert.doesNotMatch(skill, /"comments":/);
+  assert.doesNotMatch(skill, /Default `comment`/);
+  assert.match(skill, /"findings": \[/);
 });
 
 test("skill preserves the user's language and marks code in generated review prose", () => {

@@ -150,6 +150,10 @@ export interface CollectOptions {
   repo?: string;
   base?: string;
   revisions?: string[];
+  /** Compare against the index (git diff --cached). */
+  cached?: boolean;
+  /** Limit local diffs to these Git pathspecs. */
+  pathspecs?: string[];
 }
 
 export const PR_FIELDS =
@@ -242,9 +246,25 @@ function rejectOption(value: string, label: string): void {
 }
 
 /** Run `git diff` with a fixed output format regardless of user configuration. */
-function gitDiff(run: CommandRunner, root: string, revisions: readonly string[]): string {
+function gitDiff(
+  run: CommandRunner,
+  root: string,
+  revisions: readonly string[],
+  scope: { cached?: boolean; pathspecs?: readonly string[] } = {},
+): string {
   revisions.forEach((revision) => rejectOption(revision, "Revision"));
-  return run("git", [...GIT_DIFF_ARGS, "--end-of-options", ...revisions], { cwd: root });
+  return run(
+    "git",
+    [
+      ...GIT_DIFF_ARGS,
+      ...(scope.cached ? ["--cached"] : []),
+      "--end-of-options",
+      ...revisions,
+      // Pathspecs always follow "--", so they can never be read as revisions or options.
+      ...(scope.pathspecs?.length ? ["--", ...scope.pathspecs] : []),
+    ],
+    { cwd: root },
+  );
 }
 
 /** Resolve a revision to a commit SHA, rejecting option-like input. */
@@ -452,6 +472,10 @@ export function collectFileContents(
         const source =
           context.git.baseRef === "INDEX" ? `:${file.oldPath}` : `${baseRevision}:${file.oldPath}`;
         content = run("git", ["show", "--end-of-options", source], {
+          cwd: context.repository.root,
+        });
+      } else if (context.git.headRef === "INDEX") {
+        content = run("git", ["show", "--end-of-options", `:${file.path}`], {
           cwd: context.repository.root,
         });
       } else if (context.git.headRef && context.git.headRef !== "WORKTREE") {
@@ -730,9 +754,21 @@ function collectLocalContext(
       baseSha = verifyCommit(run, root, baseRef);
       diffLabel = `${baseRef} ↔ ${headRef}`;
     }
+    if (options.cached) {
+      if (revisions.length > 1 || revisions.some((revision) => revision.includes(".."))) {
+        throw new Error("--cached accepts at most one revision and no range.");
+      }
+      baseRef = revisions[0] ?? "HEAD";
+      baseSha = verifyCommit(run, root, baseRef);
+      headRef = "INDEX";
+      diffLabel = revisions.length ? `${baseRef} ↔ staged changes` : "Staged changes";
+    }
     let headSha = facts.git.headSha;
-    if (headRef !== "WORKTREE") headSha = verifyCommit(run, root, headRef);
-    const diff = gitDiff(run, root, revisions);
+    if (headRef !== "WORKTREE" && headRef !== "INDEX") headSha = verifyCommit(run, root, headRef);
+    const diff = gitDiff(run, root, revisions, {
+      cached: options.cached,
+      pathspecs: options.pathspecs,
+    });
     const preflight = preflightPatch(diff, run, facts.repository.root);
     const context: CollectedContext = {
       schemaVersion: 1,
@@ -749,7 +785,11 @@ function collectLocalContext(
         baseRef,
         ...(baseSha ? { baseSha } : {}),
         headRef,
-        diffArgs: revisions,
+        diffArgs: [
+          ...(options.cached ? ["--cached"] : []),
+          ...revisions,
+          ...(options.pathspecs?.length ? ["--", ...options.pathspecs] : []),
+        ],
         diffLabel,
       },
       pullRequest: null,
@@ -795,7 +835,7 @@ function collectLocalContext(
       });
     }
   }
-  const diff = gitDiff(run, root, [baseSha]);
+  const diff = gitDiff(run, root, [baseSha], { pathspecs: options.pathspecs });
   const preflight = preflightPatch(diff, run, root);
   const context: CollectedContext = {
     schemaVersion: 1,

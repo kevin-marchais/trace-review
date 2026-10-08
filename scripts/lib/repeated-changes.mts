@@ -110,7 +110,7 @@ export function parseDetectorRuleSet(value: unknown): DetectorRuleSet {
       if (!pattern) {
         throw new Error(`rules[${ruleIndex}].operations[${operationIndex}].pattern is required.`);
       }
-      if (pattern.length > 1_000) {
+      if (String(operation.pattern).length > 1_000) {
         throw new Error(
           `rules[${ruleIndex}].operations[${operationIndex}].pattern cannot exceed 1000 characters.`,
         );
@@ -131,10 +131,13 @@ export function parseDetectorRuleSet(value: unknown): DetectorRuleSet {
           : { location: operation.location as DetectorRuleOperation["location"] }),
       };
     });
-    const minimumFiles = rule.minimumFiles === undefined ? undefined : Number(rule.minimumFiles);
+    const minimumFiles = rule.minimumFiles as number | undefined;
     if (
       minimumFiles !== undefined &&
-      (!Number.isInteger(minimumFiles) || minimumFiles < 2 || minimumFiles > 10_000)
+      (typeof minimumFiles !== "number" ||
+        !Number.isInteger(minimumFiles) ||
+        minimumFiles < 2 ||
+        minimumFiles > 10_000)
     ) {
       throw new Error(`rules[${ruleIndex}].minimumFiles must be an integer from 2 to 10000.`);
     }

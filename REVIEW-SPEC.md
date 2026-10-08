@@ -26,6 +26,43 @@ human-oriented diagnostics.
 Deep audit is deliberately not selected automatically by the generator.
 Choosing it changes the analysis workflow, not the meaning of a finding.
 
+## Model result (`review-result.v1`)
+
+A language model, or an agent using `--llm none`, writes one result that
+`finish` validates before it generates the spec. Its contract is
+[`schemas/review-result.v1.schema.json`](schemas/review-result.v1.schema.json);
+the per-run copy in `.review/lm/result.schema.json` also fixes the mode and the
+finding budget. Validation applies the schema first, then the semantic rules
+below, and reports a list of diagnostics, each with `code`, JSON `path`,
+`message`, and usually a `hint`.
+
+- `summary` (Markdown) and a non-empty `groups` array are required.
+- Each group needs `title`, `intent`, `risk`, `confidence`, `evidence`,
+  `reviewerChecks`, and `titleEvidence`, plus at least one of `from` and
+  `changeIds`. `from` lists deterministic candidate group IDs (`g1`, `g2`, …)
+  whose changes all join the group; `changeIds` lists single change IDs and
+  moves them even when their candidate group is referenced elsewhere. A change
+  assigned nowhere is placed in its candidate group and recorded under
+  `placement.autoPlaced` in `groups.json`. The older form that lists every
+  change in `changeIds` remains valid.
+- Titles must be unique and change-specific; `titleEvidence.changeIds` must
+  belong to the group; repeated-pattern units stay together in a group of
+  their own; `readAfter` names other group titles and must not form a cycle.
+- Workspace results omit `review`. LM-analysis and deep-audit results require
+  `review: { verdict, global, findings }`.
+- A finding is anchored either by `row`, a row ID from the patch such as
+  `src/a.ts#h0:a12` (added new line 12) or `src/a.ts#h0:d7` (removed old line
+  7), or by `file` plus `line`. Anchors are checked against the rows the diff
+  actually shows: added, removed, and context lines. A line that only falls
+  inside a change unit's coarse range is rejected.
+
+`finish` converts findings to the spec's `review.comments` (always `file` plus
+`line`). The result calls them `findings`; the spec calls them `comments`.
+
+Adaptive detector rules have their own contract,
+[`schemas/detector-rules.v1.schema.json`](schemas/detector-rules.v1.schema.json),
+described in [docs/ADAPTIVE-DETECTORS.md](docs/ADAPTIVE-DETECTORS.md).
+
 ## Required structure
 
 ```json
@@ -62,6 +99,33 @@ and the legacy file-level `groups` array remain low-level compatibility inputs
 for direct builder users; they are not the skill's review-generation workflow
 and may expose deterministic or hand-authored labels.
 PR ids and group ids must be unique.
+
+### Field reference
+
+| Field | Where | Meaning |
+|-------|-------|---------|
+| `schemaVersion` | top | Required. Always `1`; unknown versions are rejected. |
+| `mode` | top | Required. `workspace`, `lm-analysis`, or `deep-audit`. |
+| `title` | top | Document title (default `Code Review`). |
+| `reviewId` | top | localStorage key for comments (default: slug of title). Keep stable. |
+| `generated` | top | Free-text date/context line (default: local generation date and time). |
+| `prs[].title` | per PR | Tab label and summary heading. |
+| `prs[].url` | per PR | Optional link to the PR or branch. |
+| `prs[].github` | per PR | Optional publication target: `{ repository, pullRequest, headSha }`. |
+| `prs[].summary` | per PR | Markdown. Ignored if `blocks` is set. |
+| `prs[].diagrams[]` | per PR | `{ title?, svgFile\|svg\|mermaid }`. Ignored if `blocks` is set. |
+| `prs[].blocks[]` | per PR | Summary blocks; see [docs/REVIEW-INTERFACE.md](docs/REVIEW-INTERFACE.md). |
+| `prs[].diffFile` | per PR | Path to a unified-diff file (relative to the spec). |
+| `prs[].diff` | per PR | Inline unified-diff string (alternative to `diffFile`). |
+| `prs[].fileContentsFile` | per PR | Bounded whole-file bundle for the file viewer. |
+| `prs[].groupFile` | per PR | Finalized grouping fact pack (relative to the spec). |
+| `prs[].changeGroups` | per PR | Inline grouping fact pack. |
+| `prs[].autoGroups` | per PR | Detect and validate groups while building. |
+| `prs[].groups` | per PR | Legacy file-level groups: `[{ id, title, kind?, note?, collapsed?, files[] }]`. |
+| `prs[].review` | per PR | Required in `lm-analysis` and `deep-audit`: `{ verdict?, global?, comments[] }`. Forbidden in `workspace`. |
+
+One PR renders without tabs; two or more get a tab bar with per-PR comment
+counts.
 
 ## Optional GitHub publication context
 
@@ -112,7 +176,7 @@ verifiable `rationale`. Focused analysis also requires two to four short,
 finding-specific response `options`; `suggestedChange` is optional and contains
 a concrete replacement when one is justified. Reviewers may select one option
 and Reply independently. Focused analysis also enforces the fact-derived budget
-written by the `prepare-lm-analysis` CLI.
+written by `prepare` (`analysis-input.json`, `findingContract.maxFindings`).
 
 ## Validation
 
