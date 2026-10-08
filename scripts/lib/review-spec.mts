@@ -201,7 +201,7 @@ export function validateReviewSpec(spec: unknown, options: ValidationOptions = {
         );
         if (
           requireString(pr.github.repository, `${root}.github.repository`) &&
-          !/^[^/\s]+\/[^/\s]+$/.test(pr.github.repository)
+          !/^[\w.-]+\/[\w.-]+$/.test(pr.github.repository)
         ) {
           add(
             "invalid-repository",

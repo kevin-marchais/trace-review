@@ -128,6 +128,24 @@ test("focused input accepts the collector's current local and pull-request field
   assert.equal(input.target.description, "Collector description.");
 });
 
+test("a fork clone targets the pull request's base repository", () => {
+  const input = prepareAnalysisInput(
+    {
+      ...context,
+      repository: { root: "C:/work/widgets", owner: "fork-owner", name: "widgets" },
+      pullRequest: {
+        number: 43,
+        url: "https://github.com/acme/widgets/pull/43",
+        title: "Fork contribution",
+        headSha: "pr456",
+      },
+    },
+    { mode: "lm-analysis" },
+  );
+
+  assert.equal(input.target.repository, "acme/widgets");
+});
+
 test("legacy focused-analysis names are rejected", () => {
   for (const mode of ["ai-analysis", "review"]) {
     assert.throws(

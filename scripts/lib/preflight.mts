@@ -1,4 +1,7 @@
 import path from "node:path";
+import { normalizePatchText, parseUnifiedDiff } from "./diff-parse.mjs";
+
+export { decodeGitPath, parseDiffPaths } from "./diff-parse.mjs";
 
 export type DiagnosticLevel = "error" | "warning";
 
@@ -17,10 +20,6 @@ export interface PreflightFile {
   binary: boolean;
   generated: boolean;
   type: string;
-}
-
-interface MutablePreflightFile extends PreflightFile {
-  _addedLines: string[];
 }
 
 export interface WhitespaceError {
@@ -113,62 +112,6 @@ const GENERATED_PATHS = [
   /\.(min\.(js|css)|generated\.[^.]+)$/i,
 ];
 
-const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
-
-export function decodeGitPath(token: string): string {
-  if (!token.startsWith('"') || !token.endsWith('"')) return token;
-  const input = token.slice(1, -1);
-  const bytes: number[] = [];
-  const escapes: Readonly<Record<string, number>> = {
-    a: 0x07,
-    b: 0x08,
-    t: 0x09,
-    n: 0x0a,
-    v: 0x0b,
-    f: 0x0c,
-    r: 0x0d,
-  };
-  for (let index = 0; index < input.length; index++) {
-    if (input[index] !== "\\") {
-      const codePoint = input.codePointAt(index);
-      if (codePoint === undefined) break;
-      bytes.push(...textEncoder.encode(String.fromCodePoint(codePoint)));
-      if (codePoint > 0xffff) index++;
-      continue;
-    }
-    index++;
-    const octal = /^[0-7]{1,3}/.exec(input.slice(index));
-    if (octal) {
-      bytes.push(Number.parseInt(octal[0], 8));
-      index += octal[0].length - 1;
-    } else {
-      const escaped = input[index] ?? "";
-      const escapedByte = escapes[escaped];
-      if (escapedByte !== undefined) bytes.push(escapedByte);
-      else bytes.push(...textEncoder.encode(escaped));
-    }
-  }
-  return textDecoder.decode(Uint8Array.from(bytes));
-}
-
-export function parseDiffPaths(line: string): { oldPath: string; path: string } | null {
-  const unquoted = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
-  if (unquoted) return { oldPath: unquoted[1], path: unquoted[2] };
-  const quoted = /^diff --git ("(?:\\.|[^"])*") ("(?:\\.|[^"])*")$/.exec(line);
-  if (!quoted) return null;
-  const oldPath = decodeGitPath(quoted[1]).replace(/^a\//, "");
-  const newPath = decodeGitPath(quoted[2]).replace(/^b\//, "");
-  return { oldPath, path: newPath };
-}
-
-function parseMarkerPath(line: string, marker: string): string | null {
-  if (!line.startsWith(marker)) return null;
-  const decoded = decodeGitPath(line.slice(marker.length));
-  if (decoded === "/dev/null") return decoded;
-  return decoded.replace(/^[ab]\//, "");
-}
-
 function fileType(file: string): string {
   const basename = path.posix.basename(file).toLowerCase();
   if (basename === "cmakelists.txt" || basename.endsWith(".cmake")) return "cmake";
@@ -185,80 +128,38 @@ function isGenerated(file: string, addedLines: readonly string[]): boolean {
     );
 }
 
-function finishFile(file: MutablePreflightFile | null): PreflightFile | null {
-  if (!file) return null;
-  file.type = fileType(file.path);
-  file.generated = isGenerated(file.path, file._addedLines);
-  const { _addedLines: _, ...finished } = file;
-  return finished;
-}
-
 export function analyzePatch(text: string): PatchAnalysis {
-  const normalized = String(text).replace(/\r\n?/g, "\n");
-  const files: PreflightFile[] = [];
+  const source = String(text);
+  const parsed = parseUnifiedDiff(source);
   const whitespaceErrors: WhitespaceError[] = [];
   const diagnostics: Diagnostic[] = [];
-  let current: MutablePreflightFile | null = null;
-  let newLine = 0;
-
-  const pushCurrent = () => {
-    const finished = finishFile(current);
-    if (finished) files.push(finished);
-    current = null;
-  };
-
-  for (const line of normalized.split("\n")) {
-    let match;
-    const diffPaths = parseDiffPaths(line);
-    if (diffPaths) {
-      pushCurrent();
-      current = {
-        path: diffPaths.path,
-        oldPath: diffPaths.oldPath,
-        additions: 0,
-        deletions: 0,
-        binary: false,
-        generated: false,
-        type: "other",
-        _addedLines: [],
-      };
-      continue;
-    }
-    if (!current) continue;
-    if (/^(GIT binary patch|Binary files? )/.test(line)) {
-      current.binary = true;
-      continue;
-    }
-    const newMarkerPath = parseMarkerPath(line, "+++ ");
-    if (newMarkerPath && newMarkerPath !== "/dev/null") {
-      current.path = newMarkerPath;
-      continue;
-    }
-    if ((match = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line))) {
-      newLine = Number(match[1]);
-      continue;
-    }
-    if (line.startsWith("+") && !line.startsWith("+++")) {
-      const content = line.slice(1);
-      current.additions++;
-      current._addedLines.push(content);
-      if (/[ \t]+$/.test(content)) {
-        whitespaceErrors.push({
-          file: current.path,
-          line: newLine,
-          kind: "trailing-whitespace",
-        });
+  const files = parsed.map((file): PreflightFile => {
+    const addedLines: string[] = [];
+    for (const hunk of file.hunks) {
+      for (const line of hunk.lines) {
+        if (line.kind !== "add") continue;
+        addedLines.push(line.text);
+        if (/[ \t]+$/.test(line.text)) {
+          whitespaceErrors.push({
+            file: file.path,
+            line: line.newNo ?? 0,
+            kind: "trailing-whitespace",
+          });
+        }
       }
-      newLine++;
-    } else if (line.startsWith("-") && !line.startsWith("---")) {
-      current.deletions++;
-    } else if (line.startsWith(" ")) {
-      newLine++;
     }
-  }
-  pushCurrent();
+    return {
+      path: file.path,
+      oldPath: file.oldPath,
+      additions: file.additions,
+      deletions: file.deletions,
+      binary: file.binary,
+      generated: isGenerated(file.path, addedLines),
+      type: fileType(file.path),
+    };
+  });
 
-  if (normalized.trim() && files.length === 0) {
+  if (source.trim() && !parsed.some((file) => file.gitHeader)) {
     diagnostics.push({
       level: "error",
       code: "invalid-patch",
@@ -299,10 +200,10 @@ export function analyzePatch(text: string): PatchAnalysis {
 }
 
 export function preflightPatch(text: string, run: CommandRunner, cwd: string): PatchAnalysis {
-  const normalized = String(text).replace(/\r\n?/g, "\n");
-  const result = analyzePatch(normalized);
+  const source = normalizePatchText(String(text));
+  const result = analyzePatch(source);
   try {
-    const numstat = run("git", ["apply", "--numstat", "-"], { cwd, input: normalized });
+    const numstat = run("git", ["apply", "--numstat", "-"], { cwd, input: source });
     result.patch.gitApply = {
       valid: true,
       numstat: String(numstat || "").trim(),

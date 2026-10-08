@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { collectFileContents, collectPrContext } from "./lib/pr-context.mjs";
 import type { CollectOptions } from "./lib/pr-context.mjs";
 import type { CommandRunner, RunOptions } from "./lib/preflight.mjs";
-import { errorMessage } from "./lib/cli.mjs";
+import { errorMessage, requiredValue } from "./lib/cli.mjs";
 
 interface Args extends CollectOptions {
   pr: string;
@@ -29,7 +29,8 @@ Options:
   --pr <number|url> Collect an explicitly selected pull request.
   --pr none        Intentionally disable remote context and collect a local diff.
   --no-remote      Alias for --pr none.
-  --base <ref>     Local diff base (default: origin's default branch, or HEAD).
+  --base <ref>     Local diff base; the diff starts at its merge-base with HEAD
+                   (default: origin's default branch, or HEAD).
   --git-diff       Use exact git-diff revision semantics; repeat --revision for refs.`);
   process.exit(message ? 1 : 0);
 }
@@ -38,16 +39,16 @@ function parseArgs(argv: readonly string[]): Args {
   const args: Args = { pr: "auto", repo: process.cwd() };
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index];
-    if (arg === "--repo") args.repo = argv[++index];
-    else if (arg === "--pr") args.pr = argv[++index];
-    else if (arg === "--base") args.base = argv[++index];
-    else if (arg === "--out") args.out = argv[++index];
-    else if (arg === "--diff-out") args.diffOut = argv[++index];
-    else if (arg === "--files-out") args.filesOut = argv[++index];
+    if (arg === "--repo") args.repo = requiredValue(argv, index++, arg, usage);
+    else if (arg === "--pr") args.pr = requiredValue(argv, index++, arg, usage);
+    else if (arg === "--base") args.base = requiredValue(argv, index++, arg, usage);
+    else if (arg === "--out") args.out = requiredValue(argv, index++, arg, usage);
+    else if (arg === "--diff-out") args.diffOut = requiredValue(argv, index++, arg, usage);
+    else if (arg === "--files-out") args.filesOut = requiredValue(argv, index++, arg, usage);
     else if (arg === "--git-diff") args.revisions = [];
     else if (arg === "--revision") {
       args.revisions ??= [];
-      args.revisions.push(argv[++index]);
+      args.revisions.push(requiredValue(argv, index++, arg, usage));
     } else if (arg === "--no-remote") args.pr = "none";
     else if (arg === "--help" || arg === "-h") args.help = true;
     else usage(`Unknown option: ${arg}`);
@@ -79,18 +80,8 @@ const run: CommandRunner = (
   return result.stdout;
 };
 
-function ensureValue(args: Args, key: keyof Args, option: string): void {
-  if (args[key] === undefined) usage(`${option} requires a value`);
-}
-
 const args = parseArgs(process.argv.slice(2));
 if (args.help) usage();
-ensureValue(args, "repo", "--repo");
-ensureValue(args, "pr", "--pr");
-if (process.argv.includes("--base")) ensureValue(args, "base", "--base");
-if (process.argv.includes("--out")) ensureValue(args, "out", "--out");
-if (process.argv.includes("--diff-out")) ensureValue(args, "diffOut", "--diff-out");
-if (process.argv.includes("--files-out")) ensureValue(args, "filesOut", "--files-out");
 
 try {
   const context = collectPrContext(args, run);

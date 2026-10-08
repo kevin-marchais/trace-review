@@ -83,7 +83,7 @@ jobs:
 
           npx_dir="$(mktemp -d)"
           cd "$npx_dir"
-          npx --yes skills@latest add \
+          npx --yes skills@1.7.1 add \
             "https://github.com/$GITHUB_REPOSITORY/tree/$RELEASE_TAG/skills/trace-review" \
             --agent codex --yes
           npx_skill="$(find "$npx_dir" -path '*/trace-review/SKILL.md' -print -quit)"

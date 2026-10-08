@@ -5,7 +5,7 @@ import path from "node:path";
 import { finalizeLmGrouping } from "./lib/lm-groups.mjs";
 import type { ChangeGrouping } from "./lib/change-groups.mjs";
 import type { LmGroupingResult } from "./lib/lm-groups.mjs";
-import { errorMessage, parseJson } from "./lib/cli.mjs";
+import { errorMessage, parseJson, requiredValue } from "./lib/cli.mjs";
 
 interface Args {
   candidates?: string;
@@ -26,9 +26,9 @@ function parseArgs(argv: readonly string[]): Args {
   const args: Args = {};
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index];
-    if (arg === "--candidates") args.candidates = argv[++index];
-    else if (arg === "--result") args.result = argv[++index];
-    else if (arg === "--out") args.out = argv[++index];
+    if (arg === "--candidates") args.candidates = requiredValue(argv, index++, arg, usage);
+    else if (arg === "--result") args.result = requiredValue(argv, index++, arg, usage);
+    else if (arg === "--out") args.out = requiredValue(argv, index++, arg, usage);
     else if (arg === "--help" || arg === "-h") args.help = true;
     else usage(`Unknown option: ${arg}`);
   }

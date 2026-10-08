@@ -38,7 +38,8 @@ const templateDestination = path.join(runtimeRoot, "templates", "review.template
 fs.mkdirSync(path.dirname(templateDestination), { recursive: true });
 fs.writeFileSync(
   templateDestination,
-  templateSource.replace("{{CLIENT_SCRIPT}}", clientScript),
+  // A function replacer keeps "$&", "$'" etc. in the client script literal.
+  templateSource.replace("{{CLIENT_SCRIPT}}", () => clientScript),
   "utf8",
 );
 

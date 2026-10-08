@@ -160,7 +160,7 @@ export function parseGithubReviewPlan(value: unknown): GithubReviewPlan {
   if (
     !objectValue(target) ||
     typeof target.repository !== "string" ||
-    !/^[^/\s]+\/[^/\s]+$/.test(target.repository) ||
+    !/^[\w.-]+\/[\w.-]+$/.test(target.repository) ||
     !positiveInteger(target.pullRequest) ||
     typeof target.headSha !== "string" ||
     !target.headSha.trim() ||

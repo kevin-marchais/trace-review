@@ -10,11 +10,18 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        node-version: [22, 24]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node-version: [24]
+        include:
+          - os: ubuntu-latest
+            node-version: 22
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Check out the repository
         uses: actions/checkout@v6
@@ -34,6 +41,18 @@ jobs:
 
       - name: Check types, lint, formatting, and tests
         run: bun run check
+
+      - name: Smoke-test the runtime end to end under Node
+        run: |
+          repo="$(mktemp -d)"
+          git -C "$repo" init -q -b main
+          printf 'export const value = 1;\n' > "$repo/app.js"
+          git -C "$repo" add app.js
+          git -C "$repo" -c user.name=CI -c user.email=ci@example.invalid commit -q -m initial
+          printf 'export const value = 2;\n' > "$repo/app.js"
+          node dist/runtime/scripts/trace-review.mjs quick --repo "$repo" --no-open
+          test -s "$repo/.review/review-working-tree-changes.html"
+          node dist/runtime/scripts/validate-review-spec.mjs --spec "$repo/.review/spec.json"
 
       - name: Smoke-test standard skill installation
         run: |
