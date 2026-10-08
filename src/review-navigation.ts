@@ -70,14 +70,27 @@ export function firstNavigationLineMatch(
   return undefined;
 }
 
+// Normalising every file's content is the expensive part of a search, so it
+// is done once per item object and reused for every later query.
+const haystacks = new WeakMap<NavigationItem, string>();
+function itemHaystack(item: NavigationItem): string {
+  let haystack = haystacks.get(item);
+  if (haystack === undefined) {
+    haystack = searchable([item.path, item.content, item.findingText].join("\n"));
+    haystacks.set(item, haystack);
+  }
+  return haystack;
+}
+
 export function filterNavigationItems(
   items: readonly NavigationItem[],
   query: NavigationQuery,
 ): NavigationItem[] {
   const terms = searchTerms(query.text);
   return items.filter((item) => {
+    const haystack = terms.length ? itemHaystack(item) : "";
     return (
-      containsTerms([item.path, item.content, item.findingText].join("\n"), terms) &&
+      terms.every((term) => haystack.includes(term)) &&
       (!query.unread || !item.viewed) &&
       (!query.openFindings || item.hasOpenFinding) &&
       (!query.tests || item.test) &&

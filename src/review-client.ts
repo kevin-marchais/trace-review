@@ -8,6 +8,17 @@ import {
 } from "../scripts/lib/github-review.mjs";
 import { renderFindingMarkdown, renderInlineMarkdown } from "./inline-markdown.js";
 import {
+  SHORTCUTS,
+  STATE_VERSION,
+  debounce,
+  hunkGaps,
+  type HunkGaps,
+  markdownCodeBlock,
+  markdownListItem,
+  normalizeStoredState,
+  shortcutAction,
+} from "./review-helpers.js";
+import {
   filterNavigationItems,
   findingsWithinNavigationLines,
   firstNavigationLineMatch,
@@ -99,6 +110,7 @@ interface SplitPair {
   l: ClientRow | null;
   r: ClientRow | null;
   ctx?: boolean;
+  gap?: number;
 }
 
 interface DiffRangeSelection {
@@ -163,6 +175,7 @@ interface StoredFileComment {
 }
 
 interface ReviewState {
+  version: number;
   general: Record<string, string>;
   lines: Record<string, StoredLineComment>;
   aiState: Record<string, string>;
@@ -193,6 +206,8 @@ interface AutomatedReview {
 }
 
 interface TreeFile extends NavigationItem {
+  findingRefs: AutomatedFinding[];
+  topSeverity: string;
   change: string;
   topic: string;
   name: string;
@@ -236,28 +251,15 @@ function eventElement(event: Event): UiElement | null {
   const findingCursor: Record<string, number> = {};
 
   // ---- state ----
-  let state: ReviewState = {
-    general: {},
-    lines: {},
-    aiState: {},
-    aiReply: {},
-    files: {},
-    viewed: {},
-    grouping: {},
-    attachments: {},
-  };
+  // Loaded state is validated field by field: a corrupt or foreign entry is
+  // dropped instead of breaking the page.
+  let storedState: unknown = null;
   try {
     const raw = localStorage.getItem(STORE_KEY);
-    if (raw) state = JSON.parse(raw) as ReviewState;
+    if (raw) storedState = JSON.parse(raw);
   } catch (e) {}
-  state.general = state.general || {};
-  state.lines = state.lines || {};
-  state.aiState = state.aiState || {};
-  state.aiReply = state.aiReply || {};
-  state.files = state.files || {};
-  state.viewed = state.viewed || {};
-  state.grouping = state.grouping || {};
-  state.attachments = state.attachments || {};
+  const state = normalizeStoredState(storedState) as unknown as ReviewState;
+  state.version = STATE_VERSION;
 
   // ---- syntax highlighting (highlight.js, loaded above; degrades offline) ----
   // Highlight a whole block and split into per-line HTML, keeping <span>s
@@ -389,11 +391,29 @@ function eventElement(event: Event): UiElement | null {
       if (r.t !== "c") r._hl = applyWordDiffMarkup(r._hl, r.h);
     }
   }
+  // Saving can fail (quota exceeded by pasted images, storage disabled). Say so
+  // without blocking the reviewer, and clear the warning once a save succeeds.
+  let saveFailed = false;
   const save = (): void => {
     try {
       localStorage.setItem(STORE_KEY, JSON.stringify(state));
-    } catch (e) {}
+      if (saveFailed) {
+        saveFailed = false;
+        document.getElementById("saveWarning").hidden = true;
+      }
+    } catch (error) {
+      if (saveFailed) return;
+      saveFailed = true;
+      const quota = error instanceof DOMException && /quota/i.test(error.name + error.message);
+      document.getElementById("saveWarningText").textContent = quota
+        ? "Browser storage is full, so recent comments are not saved. Copy or share the review, or remove pasted images."
+        : "This browser blocked storage, so recent comments are not saved. Copy or share the review before closing the page.";
+      document.getElementById("saveWarning").hidden = false;
+    }
   };
+  document.getElementById("dismissSaveWarning")?.addEventListener("click", () => {
+    document.getElementById("saveWarning").hidden = true;
+  });
   const uid = (pr?: string, file?: string, key?: string): string =>
     (pr ?? "") + "\0" + (file ?? "") + "\0" + (key ?? "");
   const escAttr = (s: unknown): string =>
@@ -494,6 +514,62 @@ function eventElement(event: Event): UiElement | null {
     });
   }
 
+  // ---- dialogs: focus moves in, Tab stays inside, Escape closes, focus returns ----
+  const openDialogs: UiElement[] = [];
+  const dialogReturnFocus = new Map<UiElement, Element | null>();
+  const dialogClosers = new Map<UiElement, () => void>();
+  const FOCUSABLE =
+    'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),summary,[tabindex]:not([tabindex="-1"])';
+  function focusableIn(root: UiElement): UiElement[] {
+    return [...root.querySelectorAll(FOCUSABLE)].filter(
+      (element) => element.getClientRects().length > 0,
+    );
+  }
+  function openDialog(dialog: UiElement, initial?: UiElement | null): void {
+    if (dialog.hidden) {
+      dialogReturnFocus.set(dialog, document.activeElement);
+      openDialogs.push(dialog);
+    }
+    dialog.hidden = false;
+    const card = dialog.querySelector(".modal-card");
+    if (card && !card.hasAttribute("tabindex")) card.setAttribute("tabindex", "-1");
+    (initial || focusableIn(dialog)[0] || card)?.focus();
+  }
+  function closeDialog(dialog: UiElement): void {
+    if (dialog.hidden) return;
+    dialog.hidden = true;
+    const index = openDialogs.indexOf(dialog);
+    if (index >= 0) openDialogs.splice(index, 1);
+    const back = dialogReturnFocus.get(dialog);
+    dialogReturnFocus.delete(dialog);
+    if (back instanceof HTMLElement && back.isConnected) back.focus();
+  }
+  function closeTopDialog(): boolean {
+    const top = openDialogs[openDialogs.length - 1];
+    if (!top) return false;
+    (dialogClosers.get(top) || (() => closeDialog(top)))();
+    return true;
+  }
+  document.addEventListener("keydown", (event) => {
+    const top = openDialogs[openDialogs.length - 1];
+    if (!top || event.key !== "Tab") return;
+    const items = focusableIn(top);
+    if (!items.length) {
+      event.preventDefault();
+      return;
+    }
+    const first = items[0],
+      last = items[items.length - 1],
+      active = document.activeElement;
+    if (event.shiftKey && (active === first || !top.contains(active))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (active === last || !top.contains(active))) {
+      event.preventDefault();
+      first.focus();
+    }
+  });
+
   // ---- diff table builders (client-side, per mode) ----
   function gutter(
     file: string,
@@ -506,6 +582,44 @@ function eventElement(event: Event): UiElement | null {
   ): string {
     return `<td class="gutter" data-file="${escAttr(file)}" data-key="${escAttr(key)}" data-lineno="${lineno}" data-code="${escAttr(c)}" data-fingerprint="${escAttr(lineFingerprint || "")}" data-content-fingerprint="${escAttr(contentFingerprint || "")}" data-diff-fingerprint="${escAttr(diffFingerprint || "")}" title="Comment">+</td>`;
   }
+  // Group views keep only some rows of a hunk; say so instead of letting the
+  // line numbers jump silently.
+  function gapRow(skipped: number, columns: number): string {
+    return `<tr class="line-gap"><td colspan="${columns}">⋯ ${skipped} line${skipped === 1 ? "" : "s"} in other groups</td></tr>`;
+  }
+  // The unfiltered version of a file (the copy with the most rows) tells a
+  // group view exactly which rows of each hunk it does not show.
+  const unfilteredFiles = new Map<string, ClientFile | null>();
+  function unfilteredFile(fd: ClientFile): ClientFile | null {
+    const key = fd.reviewTarget + " " + fd.path;
+    if (!unfilteredFiles.has(key)) {
+      let best: ClientFile | null = null;
+      let bestRows = -1;
+      for (const candidate of Object.values(DATA)) {
+        if (candidate.reviewTarget !== fd.reviewTarget || candidate.path !== fd.path) continue;
+        const rows = candidate.hunks.reduce((sum, hunk) => sum + hunk.rows.length, 0);
+        if (rows > bestRows) {
+          best = candidate;
+          bestRows = rows;
+        }
+      }
+      unfilteredFiles.set(key, best);
+    }
+    return unfilteredFiles.get(key) ?? null;
+  }
+  function gapsFor(fd: ClientFile, h: ClientHunk): HunkGaps {
+    const source = unfilteredFile(fd);
+    const first = h.rows[0];
+    const original =
+      source && source !== fd && first
+        ? source.hunks.find((candidate) =>
+            candidate.rows.some(
+              (row) => row.t === first.t && row.o === first.o && row.n === first.n,
+            ),
+          )?.rows
+        : undefined;
+    return hunkGaps(h.rows, original);
+  }
   function unifiedTable(fd: ClientFile): string {
     let b = "";
     if (!fd.hunks.length) {
@@ -514,7 +628,10 @@ function eventElement(event: Event): UiElement | null {
       for (const h of fd.hunks) {
         annotateHl(h, fd.lang);
         b += `<tr class="line line-hunk"><td class="ln"></td><td class="ln"></td><td class="gutter empty"></td><td class="code">@@ ${escAttr(h.header)}</td></tr>`;
-        for (const r of h.rows) {
+        const gaps = gapsFor(fd, h);
+        for (const [index, r] of h.rows.entries()) {
+          const skipped = gaps.before.get(index);
+          if (skipped) b += gapRow(skipped, 4);
           const cls = r.t === "a" ? "line-add" : r.t === "d" ? "line-del" : "line-ctx";
           const marker = r.t === "a" ? "+" : r.t === "d" ? "-" : " ";
           const key = r.t === "d" ? "o" + r.o : String(r.n);
@@ -527,10 +644,11 @@ function eventElement(event: Event): UiElement | null {
             `<td class="code"><span class="marker">${marker}</span>${r._hl}</td>` +
             `</tr>`;
         }
+        if (gaps.after) b += gapRow(gaps.after, 4);
       }
     return `<table class="diff unified"><colgroup><col class="c-ln"><col class="c-ln"><col class="c-gut"><col></colgroup><tbody>${b}</tbody></table>`;
   }
-  function splitPairs(h: ClientHunk): SplitPair[] {
+  function splitPairs(h: ClientHunk, gaps: HunkGaps): SplitPair[] {
     const out: SplitPair[] = [];
     let dels: ClientRow[] = [],
       adds: ClientRow[] = [];
@@ -540,7 +658,12 @@ function eventElement(event: Event): UiElement | null {
       dels = [];
       adds = [];
     };
-    for (const r of h.rows) {
+    for (const [index, r] of h.rows.entries()) {
+      const skipped = gaps.before.get(index);
+      if (skipped) {
+        flush();
+        out.push({ l: null, r: null, gap: skipped });
+      }
       if (r.t === "d") dels.push(r);
       else if (r.t === "a") adds.push(r);
       else {
@@ -549,6 +672,7 @@ function eventElement(event: Event): UiElement | null {
       }
     }
     flush();
+    if (gaps.after) out.push({ l: null, r: null, gap: gaps.after });
     return out;
   }
   function splitTable(fd: ClientFile): string {
@@ -559,7 +683,11 @@ function eventElement(event: Event): UiElement | null {
       for (const h of fd.hunks) {
         annotateHl(h, fd.lang);
         b += `<tr class="line line-hunk"><td class="ln"></td><td class="code" colspan="5">@@ ${escAttr(h.header)}</td></tr>`;
-        for (const p of splitPairs(h)) {
+        for (const p of splitPairs(h, gapsFor(fd, h))) {
+          if (p.gap) {
+            b += gapRow(p.gap, 6);
+            continue;
+          }
           b += `<tr class="line">`;
           // left (old side)
           if (p.ctx && p.l && p.r) {
@@ -621,7 +749,11 @@ function eventElement(event: Event): UiElement | null {
     const candidates = new Map<string, string>();
     const candidateFingerprints = new Map<string, string>();
     let candidateRow: Element | null = tr;
-    while (candidateRow && !candidateRow.classList.contains("line-hunk")) {
+    while (
+      candidateRow &&
+      !candidateRow.classList.contains("line-hunk") &&
+      !candidateRow.classList.contains("line-gap")
+    ) {
       candidateRow
         .querySelectorAll('.gutter[data-file="' + cssEsc(file) + '"][data-key]')
         .forEach((candidate) => {
@@ -681,7 +813,13 @@ function eventElement(event: Event): UiElement | null {
     box.append(meta, ta, actions);
     td.appendChild(box);
     crow.appendChild(td);
-    tr.after(crow);
+    // A reply belongs under the finding card it answers, so skip past any LM
+    // finding rows anchored on this line.
+    let anchorRow: Element = tr;
+    while (anchorRow.nextElementSibling?.classList.contains("ai-comment")) {
+      anchorRow = anchorRow.nextElementSibling;
+    }
+    anchorRow.after(crow);
     const store = () => {
       state.lines[id] = {
         pr,
@@ -700,6 +838,7 @@ function eventElement(event: Event): UiElement | null {
       save();
       updateCounts();
       renderOrphans();
+      lineCommentChanged(id);
     };
     bindImagePaste(ta, box, attachId, store);
     ta.addEventListener("input", store);
@@ -713,6 +852,7 @@ function eventElement(event: Event): UiElement | null {
         save();
         updateCounts();
         crow.remove();
+        lineCommentChanged(id);
       }
     });
     del.addEventListener("click", () => {
@@ -722,12 +862,15 @@ function eventElement(event: Event): UiElement | null {
       updateCounts();
       renderOrphans();
       crow.remove();
+      lineCommentChanged(id);
     });
     if (prefill && !saved) store();
     return ta;
   }
   function applyComments(mount: UiElement): void {
     const pr = mount.closest("section.pr").dataset.pr;
+    // Re-anchoring may touch many comments; persist once at the end.
+    let dirty = false;
     for (const id in state.lines) {
       const c = state.lines[id];
       if (!c || c.pr !== pr) continue;
@@ -771,7 +914,7 @@ function eventElement(event: Event): UiElement | null {
         if (id !== currentId) {
           if (c.startKey && c.startKey !== oldKey) {
             c.rangeStale = true;
-            save();
+            dirty = true;
             continue;
           }
           const oldAttachmentId = attachmentId("line", c.pr, c.file, c.key);
@@ -790,15 +933,25 @@ function eventElement(event: Event): UiElement | null {
           c.code = g.dataset.code;
           c.diffFingerprint = g.dataset.diffFingerprint || "";
           state.lines[currentId] = c;
-          save();
+          dirty = true;
         }
-        c.fingerprint = g.dataset.fingerprint || "";
-        c.contentFingerprint = g.dataset.contentFingerprint || "";
-        c.diffFingerprint = g.dataset.diffFingerprint || "";
-        save();
+        const fingerprint = g.dataset.fingerprint || "";
+        const contentFingerprint = g.dataset.contentFingerprint || "";
+        const diffFingerprint = g.dataset.diffFingerprint || "";
+        if (
+          c.fingerprint !== fingerprint ||
+          c.contentFingerprint !== contentFingerprint ||
+          c.diffFingerprint !== diffFingerprint
+        ) {
+          c.fingerprint = fingerprint;
+          c.contentFingerprint = contentFingerprint;
+          c.diffFingerprint = diffFingerprint;
+          dirty = true;
+        }
         createCommentRow(g, c.text);
       }
     }
+    if (dirty) save();
   }
 
   let lineEvidenceCache: LineEvidence | null = null;
@@ -898,22 +1051,57 @@ function eventElement(event: Event): UiElement | null {
     }
   });
 
+  // ---- current file (keyboard navigation target) ----
+  let currentFile: UiElement | null = null;
+  function setCurrentFile(fileEl: UiElement): void {
+    currentFile = fileEl;
+  }
+
   // ---- LM review (inline rows + findings list) ----
   function findingOptions(finding: AutomatedFinding): string[] {
     return finding.options?.length
       ? finding.options
       : ["Address this finding", "Keep current approach"];
   }
-  function findingReviewed(id: string): boolean {
-    return Boolean(state.aiState[id] || state.aiReply[id]);
+  // A finding is reviewed once an option is chosen or a reply with content
+  // exists. Opening the reply box alone changes nothing.
+  function findingReplied(pr: string, finding: AutomatedFinding): boolean {
+    const comment = state.lines[uid(pr, finding.file, finding.key)];
+    return (
+      !!comment &&
+      hasCommentContent(comment.text, attachmentId("line", pr, finding.file, finding.key))
+    );
+  }
+  function findingReviewed(pr: string, finding: AutomatedFinding): boolean {
+    return Boolean(state.aiState[pr + " " + finding.aid]) || findingReplied(pr, finding);
+  }
+  function findingStatus(pr: string, finding: AutomatedFinding): string {
+    return [state.aiState[pr + " " + finding.aid] || "", findingReplied(pr, finding) ? "reply" : ""]
+      .filter(Boolean)
+      .join(" + ");
+  }
+  function findingAnchored(pr: string, finding: AutomatedFinding): boolean {
+    return currentLineAnchors().has(pr + "\0" + finding.file + "\0" + finding.key);
+  }
+  const findingRowRefreshers = new Map<string, Set<() => void>>();
+  function lineCommentChanged(id: string): void {
+    const refreshers = findingRowRefreshers.get(id);
+    if (!refreshers?.size) return;
+    refreshers.forEach((refresh) => refresh());
+    renderFindingList();
+    updateProgress();
+    refreshTree();
   }
   function insertAiRow(g: UiElement, c: AutomatedFinding, pr: string): void {
     const tr = g.closest("tr");
     const mount = g.closest(".diff-mount");
     const aiId = pr + " " + c.aid;
     if (mount.querySelector('.ai-comment[data-aid="' + cssEsc(aiId) + '"]')) return;
+    const severity = c.severity || "comment";
+    g.classList.add("has-finding", "sev-" + severity);
+    g.title = severity + " finding on this line · click to comment";
     const row = document.createElement("tr");
-    row.className = "comment-row ai-comment sv-" + (c.severity || "comment");
+    row.className = "comment-row ai-comment sv-" + severity;
     row.dataset.aid = aiId;
     const td = document.createElement("td");
     td.colSpan = tr.children.length;
@@ -922,8 +1110,8 @@ function eventElement(event: Event): UiElement | null {
       <div class="ai-box-head"><span class="who">✦ ${escAttr(REVIEWER)}</span><span class="sev sev-${escAttr(c.severity)}">${escAttr(c.severity)}</span><span class="ai-confidence">${Math.round(c.confidence * 100)}% confidence</span></div>
       <div class="ai-box-body">${renderFindingMarkdown(c.body)}</div>
       <div class="ai-rationale"><strong>Why:</strong> ${renderInlineMarkdown(c.rationale)}</div>
-      ${c.suggestedChange ? `<div class="ai-suggested-change"><strong>Proposed change</strong><pre><code>${escAttr(c.suggestedChange)}</code></pre></div>` : ""}
-      <div class="ai-box-actions">${options.map((option, index) => `<button data-option="${index}">${escAttr(option)}</button>`).join("")}<button data-a="reply">Reply</button><span class="ai-state"></span></div>
+      ${c.suggestedChange ? `<div class="ai-suggested-change"><strong>Proposed change</strong><pre tabindex="0"><code>${escAttr(c.suggestedChange)}</code></pre></div>` : ""}
+      <div class="ai-box-actions">${options.map((option, index) => `<button type="button" data-option="${index}" aria-pressed="false">${escAttr(option)}</button>`).join("")}<button type="button" data-a="reply">Reply</button><span class="ai-state"></span></div>
     </div>`;
     highlightMarkdownCode(td);
     row.appendChild(td);
@@ -931,15 +1119,24 @@ function eventElement(event: Event): UiElement | null {
     const optionButtons = [...td.querySelectorAll("[data-option]")],
       rep = td.querySelector('[data-a="reply"]'),
       st = td.querySelector(".ai-state");
+    const replyId = uid(pr, c.file, c.key);
+    const refreshers = findingRowRefreshers.get(replyId) ?? new Set<() => void>();
+    findingRowRefreshers.set(replyId, refreshers);
     const refresh = () => {
+      if (!row.isConnected) {
+        refreshers.delete(refresh);
+        return;
+      }
       const s = state.aiState[aiId] || "";
-      const replying = Boolean(state.aiReply[aiId]);
-      optionButtons.forEach((button, index) =>
-        button.classList.toggle("on-option", s === options[index]),
-      );
-      rep.classList.toggle("on-reply", replying);
-      st.textContent = [s, replying ? "reply" : ""].filter(Boolean).join(" + ");
+      optionButtons.forEach((button, index) => {
+        const on = s === options[index];
+        button.classList.toggle("on-option", on);
+        button.setAttribute("aria-pressed", String(on));
+      });
+      rep.classList.toggle("on-reply", findingReplied(pr, c));
+      st.textContent = findingStatus(pr, c);
     };
+    refreshers.add(refresh);
     const changed = (): void => {
       save();
       refresh();
@@ -955,14 +1152,11 @@ function eventElement(event: Event): UiElement | null {
         changed();
       }),
     );
+    // Reply only opens the comment box under this card; the finding becomes
+    // reviewed when that reply has content.
     rep.addEventListener("click", () => {
-      if (state.aiReply[aiId]) delete state.aiReply[aiId];
-      else state.aiReply[aiId] = true;
-      changed();
-      if (state.aiReply[aiId]) {
-        const ta = createCommentRow(g, "");
-        if (ta) ta.focus();
-      }
+      const ta = createCommentRow(g, "");
+      if (ta) ta.focus();
     });
     refresh();
   }
@@ -986,54 +1180,124 @@ function eventElement(event: Event): UiElement | null {
       if (!rev) return;
       list.innerHTML = rev.comments
         .map((c) => {
-          const s = state.aiState[pr + " " + c.aid] || "";
-          const replying = Boolean(state.aiReply[pr + " " + c.aid]);
-          const status = [s, replying ? "reply" : ""].filter(Boolean).join(" + ");
+          const status = findingStatus(pr, c);
           const statusHtml = status ? `<span class="fi-status">${escAttr(status)}</span>` : "";
-          return `<button class="finding-item sv-${escAttr(c.severity)}${status ? " done" : ""}" data-pr="${escAttr(pr)}" data-file="${escAttr(c.file)}" data-key="${escAttr(c.key)}" data-aid="${escAttr(c.aid)}"><span class="finding-top"><span class="sev sev-${escAttr(c.severity)}">${escAttr(c.severity)}</span><span class="finding-loc">${escAttr(c.file)}:${escAttr(c.line)}</span><span class="ai-confidence">${Math.round(c.confidence * 100)}% confidence</span>${statusHtml}</span><span class="finding-text">${renderInlineMarkdown(c.body)}</span></button>`;
+          const outside = findingAnchored(pr, c)
+            ? ""
+            : `<span class="outside-diff" title="This line is not part of the diff; opens the file instead">outside diff</span>`;
+          return `<button type="button" class="finding-item sv-${escAttr(c.severity)}${status ? " done" : ""}" data-pr="${escAttr(pr)}" data-file="${escAttr(c.file)}" data-key="${escAttr(c.key)}" data-aid="${escAttr(c.aid)}"><span class="finding-top"><span class="sev sev-${escAttr(c.severity)}">${escAttr(c.severity)}</span><span class="finding-loc">${escAttr(c.file)}:${escAttr(c.line)}</span>${outside}<span class="ai-confidence">${Math.round(c.confidence * 100)}% confidence</span>${statusHtml}</span><span class="finding-text">${renderInlineMarkdown(c.body)}</span></button>`;
         })
         .join("");
     });
   }
 
   // ---- render all mounts in a mode ----
+  // Mounts near the viewport render first (IntersectionObserver); the rest
+  // fill in during idle time. When the idle callback fires by timeout
+  // (timeRemaining() is 0 on a busy page) at least one mount still renders,
+  // so a large review never stalls on "Preparing diff…".
   let renderGeneration = 0;
+  let mountObserver: IntersectionObserver | null = null;
   function renderMount(mnt: UiElement, mode: "unified" | "split"): void {
     const fd = DATA[mnt.dataset.fid];
     if (!fd) return;
     mnt.innerHTML = mode === "split" ? splitTable(fd) : unifiedTable(fd);
     mnt.classList.remove("pending");
+    // wide code scrolls horizontally, so keyboard users must be able to focus it
+    if (!mnt.hasAttribute("tabindex")) {
+      mnt.setAttribute("tabindex", "0");
+      mnt.setAttribute("role", "region");
+      mnt.setAttribute("aria-label", "Diff of " + fd.path);
+    }
     mnt.dataset.rendered = mode;
     applyComments(mnt);
     applyReview(mnt);
   }
+  // Render a mount now if the idle renderer has not reached it yet.
+  function ensureRendered(fileEl: UiElement): void {
+    const mount = fileEl.querySelector(".diff-mount");
+    if (mount && mount.dataset.rendered !== mode) renderMount(mount, mode);
+  }
+  const whenIdle = (callback: (deadline: IdleDeadline | null) => void): void => {
+    if (typeof requestIdleCallback === "function") requestIdleCallback(callback, { timeout: 120 });
+    else setTimeout(() => callback(null), 16);
+  };
   function renderAll(mode: "unified" | "split"): void {
     const generation = ++renderGeneration;
+    mountObserver?.disconnect();
     const mounts = [...document.querySelectorAll(".diff-mount")];
     mounts.forEach((mnt) => {
       mnt.innerHTML = "";
       delete mnt.dataset.rendered;
       mnt.classList.add("pending");
     });
-    const pending = mounts;
-    pending.slice(0, 4).forEach((mnt) => renderMount(mnt, mode));
-    let cursor = 4;
+    const pending = new Set(mounts);
+    const priority: UiElement[] = [];
+    let cursor = 0;
+    let scheduled = false;
+    const nextMount = (): UiElement | undefined => {
+      while (priority.length) {
+        const mount = priority.shift();
+        if (mount && pending.has(mount)) return mount;
+      }
+      while (cursor < mounts.length) {
+        const mount = mounts[cursor++];
+        if (pending.has(mount)) return mount;
+      }
+      return undefined;
+    };
+    const renderOne = (mount: UiElement): void => {
+      pending.delete(mount);
+      mountObserver?.unobserve(mount);
+      if (mount.dataset.rendered !== mode) renderMount(mount, mode);
+    };
+    const finish = (): void => {
+      mountObserver?.disconnect();
+      mountObserver = null;
+      renderOrphans();
+    };
     const pump = (deadline: IdleDeadline | null): void => {
+      scheduled = false;
       if (generation !== renderGeneration) return;
       let count = 0;
-      while (cursor < pending.length && count < 8 && (!deadline || deadline.timeRemaining() > 2)) {
-        renderMount(pending[cursor++], mode);
+      let mount: UiElement | undefined;
+      while (
+        (count === 0 || (count < 8 && (!deadline || deadline.timeRemaining() > 2))) &&
+        (mount = nextMount())
+      ) {
+        renderOne(mount);
         count++;
       }
-      if (cursor < pending.length) {
-        requestIdleCallback(pump, { timeout: 120 });
-      } else {
-        renderOrphans();
-      }
+      if (pending.size) schedule();
+      else finish();
     };
-    if (cursor < pending.length) {
-      requestIdleCallback(pump, { timeout: 120 });
-    } else renderOrphans();
+    const schedule = (): void => {
+      if (scheduled || generation !== renderGeneration) return;
+      scheduled = true;
+      whenIdle(pump);
+    };
+    if (typeof IntersectionObserver === "function") {
+      mountObserver = new IntersectionObserver(
+        (entries) => {
+          if (generation !== renderGeneration) return;
+          const visible = entries
+            .filter((entry) => entry.isIntersecting && pending.has(entry.target as UiElement))
+            .map((entry) => entry.target as UiElement);
+          if (!visible.length) return;
+          // render what is on screen now, without waiting for idle time
+          visible.slice(0, 6).forEach(renderOne);
+          priority.unshift(...visible.slice(6));
+          if (pending.size) schedule();
+          else finish();
+        },
+        { rootMargin: "600px 0px" },
+      );
+      mounts.forEach((mount) => mountObserver?.observe(mount));
+    } else {
+      mounts.slice(0, 4).forEach(renderOne);
+    }
+    if (pending.size) schedule();
+    else finish();
   }
 
   // ---- counts ----
@@ -1101,7 +1365,7 @@ function eventElement(event: Event): UiElement | null {
     const center = complete ? "✓" : Math.round(pct * 100) + "%";
     return (
       `<div class="pd-item${complete ? " done" : ""}"><div class="pd-ringwrap">` +
-      `<svg class="pd-ring" viewBox="0 0 46 46"><circle class="pd-track" cx="23" cy="23" r="${r}"/>` +
+      `<svg class="pd-ring" viewBox="0 0 46 46" aria-hidden="true"><circle class="pd-track" cx="23" cy="23" r="${r}"/>` +
       `<circle class="pd-fill" cx="23" cy="23" r="${r}" style="stroke-dasharray:${c.toFixed(1)};stroke-dashoffset:${off.toFixed(1)}"/></svg>` +
       `<div class="pd-count">${center}</div></div><div class="pd-label">${label}</div><div class="pd-frac">${done}/${total}</div></div>`
     );
@@ -1138,7 +1402,7 @@ function eventElement(event: Event): UiElement | null {
         if (!rv) continue;
         for (const c of rv.comments) {
           ftotal++;
-          if (findingReviewed(p + " " + c.aid)) fdone++;
+          if (findingReviewed(p, c)) fdone++;
         }
       }
       if (ftotal) html += ring(fdone, ftotal, "Reviewed");
@@ -1148,8 +1412,8 @@ function eventElement(event: Event): UiElement | null {
         findingCursor[pr] = cursor;
         html +=
           `<div class="pd-find-nav"><div class="pd-find-label">Finding ${cursor + 1}/${rv.comments.length}</div>` +
-          `<button type="button" data-finding-step="-1" title="Previous finding">← Prev</button>` +
-          `<button type="button" data-finding-step="1" title="Next finding">Next →</button></div>`;
+          `<button type="button" data-finding-step="-1" title="Previous finding (p)" aria-label="Previous finding">←</button>` +
+          `<button type="button" data-finding-step="1" title="Next finding (n)" aria-label="Next finding">→</button></div>`;
       }
     }
     dock.innerHTML = html;
@@ -1243,7 +1507,11 @@ function eventElement(event: Event): UiElement | null {
       }
       return;
     }
-    const g = visibleEvidenceFiles(sec)
+    const candidates = visibleEvidenceFiles(sec).filter(
+      (file) => file.dataset.file === it.dataset.file,
+    );
+    candidates.forEach(ensureRendered);
+    const g = candidates
       .map((file) =>
         file.querySelector(
           '.gutter[data-key="' +
@@ -1254,7 +1522,17 @@ function eventElement(event: Event): UiElement | null {
         ),
       )
       .find(Boolean);
-    if (!g) return;
+    if (!g) {
+      // The anchor is outside the diff: open the file instead of doing nothing.
+      const fileEl = candidates[0];
+      if (!fileEl) return;
+      const group = fileEl.closest(".group");
+      if (group) group.classList.remove("collapsed");
+      fileEl.classList.remove("collapsed");
+      scrollFileToTop(fileEl);
+      setCurrentFile(fileEl);
+      return;
+    }
     const file = g.closest(".file");
     if (file) file.classList.remove("collapsed");
     const group = g.closest(".group");
@@ -1269,6 +1547,9 @@ function eventElement(event: Event): UiElement | null {
   });
 
   // ---- events: comment gutter (delegated, survives re-render) ----
+  // Shift-click a second gutter to extend a range from the last clicked one.
+  let lastGutter: UiElement | null = null;
+  let hoveredGutter: UiElement | null = null;
   document.getElementById("main").addEventListener("click", (e) => {
     const g = eventElement(e)?.closest(".gutter");
     if (!g || g.classList.contains("empty") || !g.dataset.key) return;
@@ -1276,8 +1557,25 @@ function eventElement(event: Event): UiElement | null {
       delete g.dataset.rangeClick;
       return;
     }
+    const mouse = e as MouseEvent;
+    if (mouse.shiftKey && lastGutter?.isConnected && lastGutter !== g) {
+      const selection = rangeFor(lastGutter, g);
+      if (selection) {
+        window.getSelection()?.removeAllRanges();
+        showRangeToolbar(selection, mouse.clientX, mouse.clientY);
+        return;
+      }
+    }
+    lastGutter = g;
     const ta = createCommentRow(g, "");
     if (ta) ta.focus();
+  });
+  document.getElementById("main").addEventListener("mouseover", (e) => {
+    const row = eventElement(e)?.closest("tr.line");
+    if (!row) return;
+    const gutters = [...row.querySelectorAll(".gutter[data-key]")];
+    // prefer the new side in split view, matching GitHub
+    hoveredGutter = gutters[gutters.length - 1] || hoveredGutter;
   });
 
   // ---- drag-select a contiguous diff range ----
@@ -1301,8 +1599,10 @@ function eventElement(event: Event): UiElement | null {
     const anchorIndex = rows.indexOf(anchorRow);
     let first = anchorIndex;
     let last = anchorIndex + 1;
-    while (first > 0 && !rows[first - 1].classList.contains("line-hunk")) first--;
-    while (last < rows.length && !rows[last].classList.contains("line-hunk")) last++;
+    const boundary = (row: UiElement): boolean =>
+      row.classList.contains("line-hunk") || row.classList.contains("line-gap");
+    while (first > 0 && !boundary(rows[first - 1])) first--;
+    while (last < rows.length && !boundary(rows[last])) last++;
     const oldSide = (anchor.dataset.key || "").startsWith("o");
     return rows
       .slice(first, last)
@@ -1390,6 +1690,11 @@ function eventElement(event: Event): UiElement | null {
     const mouse = event as MouseEvent;
     const gutter = eventElement(event)?.closest(".gutter[data-key]");
     if (!gutter || gutter.classList.contains("empty") || mouse.button !== 0) return;
+    if (mouse.shiftKey) {
+      // shift-click extends a range in the click handler; avoid text selection
+      event.preventDefault();
+      return;
+    }
     hideRangeToolbar();
     rangeDrag = {
       anchor: gutter,
@@ -1498,7 +1803,6 @@ function eventElement(event: Event): UiElement | null {
   let carbonTheme: CarbonTheme = "none";
   let carbonFile = "";
   let carbonRows: ExportPairRow[] = [];
-  let carbonHtml = "";
   let carbonClipboardHtml = "";
   let carbonSvg = "";
   let carbonPlain = "";
@@ -1707,7 +2011,7 @@ function eventElement(event: Event): UiElement | null {
           rows.map((row) => `<tr>${previewSide(row.old)}${previewSide(row.next)}</tr>`).join("") +
           `</tbody></table>`;
     return (
-      `<div class="carbon-sheet" style="width:${selectableExportWidth(rows, layout)}px;padding:${carbonTheme === "none" ? 0 : 24}px;background:${carbonThemes[carbonTheme].css}"><div class="carbon-window">` +
+      `<div class="carbon-sheet" style="min-width:${selectableExportWidth(rows, layout)}px;padding:${carbonTheme === "none" ? 0 : 24}px;background:${carbonThemes[carbonTheme].css}"><div class="carbon-window">` +
       `<div class="carbon-window-head"><span class="carbon-dots">` +
       `<span class="carbon-dot" style="background:#ff5f56"></span>` +
       `<span class="carbon-dot" style="background:#ffbd2e"></span>` +
@@ -1738,17 +2042,32 @@ function eventElement(event: Event): UiElement | null {
     );
   }
 
-  function carbonRichDocument(file: string, rows: ExportPairRow[]): string {
+  // The HTML download mirrors the preview: same layout and background choice.
+  function carbonRichDocument(
+    file: string,
+    rows: ExportPairRow[],
+    layout: "split" | "compact",
+    theme: CarbonTheme,
+  ): string {
+    const headStyle = "padding:4px 12px;color:#8b949e;background:#161b22;text-align:left";
+    const table =
+      layout === "compact"
+        ? `<thead><tr><th style="${headStyle}">Unified diff</th></tr></thead><tbody>` +
+          compactExportRows(rows)
+            .map((side) => `<tr>${richSide(side, false)}</tr>`)
+            .join("")
+        : `<thead><tr><th style="${headStyle}">Before</th>` +
+          `<th style="${headStyle};border-left:1px solid #30363d">After</th></tr></thead><tbody>` +
+          rows
+            .map((row) => `<tr>${richSide(row.old, false)}${richSide(row.next, true)}</tr>`)
+            .join("");
+    const padding = theme === "none" ? 0 : 24;
     const body =
-      `<div style="box-sizing:border-box;width:${selectableExportWidth(rows, "split")}px;padding:24px;border-radius:16px;background:linear-gradient(125deg,#7c3aed,#2563eb 52%,#0891b2)">` +
+      `<div style="box-sizing:border-box;width:max-content;min-width:${selectableExportWidth(rows, layout)}px;padding:${padding}px;border-radius:16px;background:${carbonThemes[theme].css}">` +
       `<div style="overflow:hidden;border-radius:14px;color:#e6edf3;background:#0d1117">` +
       `<div style="padding:16px 20px;color:#c9d1d9;font:600 13px ui-monospace,monospace;text-align:center">${escAttr(file)}</div>` +
-      `<table style="width:100%;border-collapse:collapse;table-layout:fixed;font:13px/24px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">` +
-      `<thead><tr><th style="padding:4px 12px;color:#8b949e;background:#161b22;text-align:left">Before</th>` +
-      `<th style="padding:4px 12px;color:#8b949e;background:#161b22;text-align:left;border-left:1px solid #30363d">After</th></tr></thead><tbody>` +
-      rows
-        .map((row) => `<tr>${richSide(row.old, false)}${richSide(row.next, true)}</tr>`)
-        .join("") +
+      `<table style="width:100%;border-collapse:collapse;tab-size:4;font:13px/24px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">` +
+      table +
       `</tbody></table></div></div>`;
     return `<!doctype html><html><head><meta charset="utf-8"><title>${escAttr(file)} diff</title></head><body>${body}</body></html>`;
   }
@@ -2096,7 +2415,6 @@ function eventElement(event: Event): UiElement | null {
   function openCarbonExport(selection: DiffRangeSelection): void {
     carbonFile = selection.file;
     carbonRows = buildExportRows(selection);
-    carbonHtml = carbonRichDocument(carbonFile, carbonRows);
     carbonPlain = carbonPlainText(carbonRows);
     renderCarbonVisuals();
     const first = selection.rows[0]?.line || "";
@@ -2115,7 +2433,7 @@ function eventElement(event: Event): UiElement | null {
       "-lines-" +
       first +
       (first === last ? "" : "-" + last);
-    carbonModal.hidden = false;
+    openDialog(carbonModal);
   }
 
   carbonModal.querySelectorAll("[data-carbon-layout]").forEach((button) => {
@@ -2132,10 +2450,10 @@ function eventElement(event: Event): UiElement | null {
     });
   });
   document.getElementById("closeCarbonModal").addEventListener("click", () => {
-    carbonModal.hidden = true;
+    closeDialog(carbonModal);
   });
   carbonModal.addEventListener("click", (event) => {
-    if (event.target === carbonModal) carbonModal.hidden = true;
+    if (event.target === carbonModal) closeDialog(carbonModal);
   });
   const showCarbonCopied = (label = "Copied ✓") => {
     const copied = document.getElementById("carbonCopied");
@@ -2145,15 +2463,10 @@ function eventElement(event: Event): UiElement | null {
   };
   const currentCarbonFilename = () =>
     carbonFilenameBase + (carbonLayout === "compact" ? "-compact" : "");
-  const downloadCarbon = (
-    content: BlobPart,
-    type: string,
-    extension: string,
-    layoutAware = true,
-  ) => {
+  const downloadCarbon = (content: BlobPart, type: string, extension: string) => {
     const link = document.createElement("a");
     link.href = URL.createObjectURL(new Blob([content], { type }));
-    link.download = (layoutAware ? currentCarbonFilename() : carbonFilenameBase) + extension;
+    link.download = currentCarbonFilename() + extension;
     link.click();
     URL.revokeObjectURL(link.href);
   };
@@ -2164,7 +2477,11 @@ function eventElement(event: Event): UiElement | null {
     link.click();
   });
   document.getElementById("downloadCarbonHtmlBtn").addEventListener("click", () => {
-    downloadCarbon(carbonHtml, "text/html;charset=utf-8", ".html", false);
+    downloadCarbon(
+      carbonRichDocument(carbonFile, carbonRows, carbonLayout, carbonTheme),
+      "text/html;charset=utf-8",
+      ".html",
+    );
   });
   document.getElementById("downloadCarbonSvgBtn").addEventListener("click", () => {
     downloadCarbon(carbonSvg, "image/svg+xml;charset=utf-8", ".svg");
@@ -2252,10 +2569,11 @@ function eventElement(event: Event): UiElement | null {
     fileModalCode.hidden = mode !== "code";
   }
   function closeFileModal(): void {
-    fileModal.hidden = true;
+    closeDialog(fileModal);
     fileModalCode.innerHTML = "";
     fileModalImage.innerHTML = "";
   }
+  dialogClosers.set(fileModal, closeFileModal);
   fileModalTabs
     .querySelectorAll("[data-file-view]")
     .forEach((button) =>
@@ -2264,6 +2582,12 @@ function eventElement(event: Event): UiElement | null {
       ),
     );
   document.querySelectorAll(".view-file-btn").forEach((button) => {
+    // Nothing to show without embedded file content, so do not offer it.
+    const contentFid = button.closest(".file")?.querySelector(".diff-mount")?.dataset.fid;
+    if (!contentFid || typeof DATA[contentFid]?.fullFile?.content !== "string") {
+      button.hidden = true;
+      return;
+    }
     button.addEventListener("click", () => {
       const fileEl = button.closest(".file");
       const fid = fileEl.querySelector(".diff-mount").dataset.fid;
@@ -2307,7 +2631,7 @@ function eventElement(event: Event): UiElement | null {
         fileModalTabs.hidden = true;
         selectFileView("code");
       }
-      fileModal.hidden = false;
+      openDialog(fileModal, document.getElementById("closeFileModal"));
     });
   });
   document.getElementById("closeFileModal").addEventListener("click", closeFileModal);
@@ -2573,9 +2897,33 @@ function eventElement(event: Event): UiElement | null {
       /\.(min\.(js|css)|generated\.[^.]+)$/i.test(path)
     );
   }
+  // The navigation index is built once per PR and order view; only the
+  // viewed / open-finding flags are refreshed on each update.
+  const treeIndexCache = new Map<string, { elements: UiElement[]; files: TreeFile[] }>();
+  const SEVERITY_RANK = ["concern", "question", "suggestion", "nit", "comment", "praise"];
   function collectTreeFiles(sec: UiElement): TreeFile[] {
     const pr = sec.dataset.pr || "";
-    return visibleEvidenceFiles(sec).map((el) => {
+    const elements = visibleEvidenceFiles(sec);
+    const key =
+      pr + "\0" + (sec.querySelector('[data-order-view="raw"]:not([hidden])') ? "raw" : "grouped");
+    let cached = treeIndexCache.get(key);
+    if (
+      !cached ||
+      cached.elements.length !== elements.length ||
+      cached.elements.some((element, index) => element !== elements[index])
+    ) {
+      cached = { elements, files: buildTreeFiles(sec, elements) };
+      treeIndexCache.set(key, cached);
+    }
+    cached.files.forEach((file, index) => {
+      file.viewed = elements[index].classList.contains("viewed");
+      file.hasOpenFinding = file.findingRefs.some((finding) => !findingReviewed(pr, finding));
+    });
+    return cached.files;
+  }
+  function buildTreeFiles(sec: UiElement, elements: UiElement[]): TreeFile[] {
+    const pr = sec.dataset.pr || "";
+    return elements.map((el) => {
       const p = el.dataset.file || "";
       const num = (sel: string): number => {
         const t = el.querySelector(".file-header " + sel);
@@ -2583,11 +2931,21 @@ function eventElement(event: Event): UiElement | null {
       };
       const metadata = navigationGroups(sec, p);
       const lines = navigationLines(el);
-      const findings = findingsWithinNavigationLines(
-        lines,
-        (REVIEW[pr]?.comments || []).filter((finding) => finding.file === p),
-      );
+      const fileFindings = (REVIEW[pr]?.comments || []).filter((finding) => finding.file === p);
+      const findings = findingsWithinNavigationLines(lines, fileFindings);
+      const findingRefs = [
+        ...findings,
+        ...fileFindings.filter((finding) => !findingAnchored(pr, finding)),
+      ];
+      const topSeverity =
+        SEVERITY_RANK.find((severity) =>
+          findingRefs.some((finding) => finding.severity === severity),
+        ) ||
+        findingRefs[0]?.severity ||
+        "";
       return {
+        findingRefs,
+        topSeverity,
         id: el.dataset.change || p,
         path: p,
         content: lines.map((line) => line.text).join("\n"),
@@ -2597,7 +2955,7 @@ function eventElement(event: Event): UiElement | null {
           key: finding.key,
           text: [finding.body, finding.rationale].join("\n"),
         })),
-        hasOpenFinding: findings.some((finding) => !findingReviewed(pr + " " + finding.aid)),
+        hasOpenFinding: findings.some((finding) => !findingReviewed(pr, finding)),
         severities: [...new Set(findings.map((finding) => finding.severity))],
         test: isTestPath(p),
         generated: isGeneratedPath(p),
@@ -2645,7 +3003,7 @@ function eventElement(event: Event): UiElement | null {
       .slice()
       .sort((a, b) => a.name.localeCompare(b.name))
       .forEach((f) => {
-        html += `<li class="ft-file${f.viewed ? " viewed" : ""}" data-file="${escAttr(f.path)}"${f.change ? ` data-change="${escAttr(f.change)}"` : ""}><div class="ft-row" role="button" tabindex="0"><span class="ft-name" title="${escAttr(f.path)}">${escAttr(f.name)}${f.topic ? `<small class="ft-topic">${escAttr(f.topic)}</small>` : ""}</span><span class="ft-stats"><span class="stat-add">+${f.add}</span> <span class="stat-del">-${f.del}</span></span></div></li>`;
+        html += `<li class="ft-file${f.viewed ? " viewed" : ""}" data-file="${escAttr(f.path)}"${f.change ? ` data-change="${escAttr(f.change)}"` : ""}><div class="ft-row" role="button" tabindex="0"><span class="ft-name" title="${escAttr(f.path)}">${escAttr(f.name)}${f.topic ? `<small class="ft-topic">${escAttr(f.topic)}</small>` : ""}</span>${f.findingRefs.length ? `<span class="ft-find sev-${escAttr(f.topSeverity)}" title="${f.findingRefs.length} finding${f.findingRefs.length === 1 ? "" : "s"}, highest: ${escAttr(f.topSeverity)}" aria-label="${f.findingRefs.length} finding${f.findingRefs.length === 1 ? "" : "s"}, highest ${escAttr(f.topSeverity)}">${f.findingRefs.length}</span>` : ""}<span class="ft-stats"><span class="stat-add">+${f.add}</span> <span class="stat-del">-${f.del}</span></span></div></li>`;
       });
     return html;
   }
@@ -2752,12 +3110,14 @@ function eventElement(event: Event): UiElement | null {
     }
   });
   const navigationSearch = document.querySelector("#fileTree [data-nav-search]");
+  const refreshTreeSoon = debounce(refreshTree, 120);
   navigationSearch.addEventListener("input", () => {
     navigationQuery.text = navigationSearch.value;
-    refreshTree();
+    refreshTreeSoon();
   });
   navigationSearch.addEventListener("keydown", (e) => {
     if (!(e instanceof KeyboardEvent) || (e.key !== "Enter" && e.key !== "ArrowDown")) return;
+    refreshTree();
     const first = document.querySelector("#fileTree .ft-file .ft-row");
     if (!first) return;
     e.preventDefault();
@@ -2842,7 +3202,8 @@ function eventElement(event: Event): UiElement | null {
     }),
   );
 
-  // ---- theme: system default, session override cycle (not persisted) ----
+  // ---- theme: system default, manual override persisted across reviews ----
+  const THEME_KEY = "htmlreview:theme";
   const themeBtn = document.getElementById("themeBtn");
   const THEMES = [
     { v: null, icon: "◐", label: "system" },
@@ -2850,13 +3211,36 @@ function eventElement(event: Event): UiElement | null {
     { v: "dark", icon: "☾", label: "dark" },
   ];
   let ti = 0;
-  themeBtn.addEventListener("click", () => {
-    ti = (ti + 1) % THEMES.length;
+  try {
+    const savedTheme = localStorage.getItem(THEME_KEY);
+    ti = Math.max(
+      0,
+      THEMES.findIndex((theme) => theme.v === savedTheme),
+    );
+  } catch (e) {}
+  function applyTheme(): void {
     const t = THEMES[ti];
     if (t.v) document.documentElement.setAttribute("data-theme", t.v);
     else document.documentElement.removeAttribute("data-theme");
     themeBtn.textContent = t.icon;
     themeBtn.title = "Theme: " + t.label;
+    themeBtn.setAttribute("aria-label", "Theme: " + t.label + ". Switch theme");
+  }
+  applyTheme();
+  themeBtn.addEventListener("click", () => {
+    ti = (ti + 1) % THEMES.length;
+    applyTheme();
+    try {
+      const theme = THEMES[ti].v;
+      if (theme) localStorage.setItem(THEME_KEY, theme);
+      else localStorage.removeItem(THEME_KEY);
+    } catch (e) {}
+  });
+
+  // ---- header overflow menu (secondary and destructive actions) ----
+  const headerMenu = document.getElementById("headerMenu") as UiElement & { open: boolean };
+  document.addEventListener("click", (event) => {
+    if (headerMenu?.open && !eventElement(event)?.closest("#headerMenu")) headerMenu.open = false;
   });
 
   // ---- export ----
@@ -2864,6 +3248,47 @@ function eventElement(event: Event): UiElement | null {
     return attachmentItems(id)
       .map((item, index) => indent + "![Pasted image " + (index + 1) + "](" + item.data + ")")
       .join("\n");
+  }
+  function fileLanguage(pr: string, file: string): string {
+    return (
+      Object.values(DATA).find((data) => data.reviewTarget === pr && data.path === file)?.lang || ""
+    );
+  }
+  // The full code of a range comment, read from the embedded diff rows.
+  function commentRangeCode(comment: StoredLineComment): { code: string; lang: string } {
+    const oldSide = comment.key.startsWith("o");
+    const start = parseInt(comment.startLineno || "", 10);
+    const end = parseInt(comment.lineno || "", 10);
+    let best = new Map<number, string>();
+    let lang = "";
+    for (const data of Object.values(DATA)) {
+      if (data.reviewTarget !== comment.pr || data.path !== comment.file) continue;
+      const lines = new Map<number, string>();
+      for (const hunk of data.hunks) {
+        for (const row of hunk.rows) {
+          const line = oldSide
+            ? row.t !== "a"
+              ? row.o
+              : undefined
+            : row.t !== "d"
+              ? row.n
+              : undefined;
+          if (line != null && line >= start && line <= end) lines.set(line, row.c);
+        }
+      }
+      if (lines.size > best.size) {
+        best = lines;
+        lang = data.lang;
+      }
+    }
+    if (!best.size) return { code: comment.code || "", lang };
+    return {
+      code: [...best.entries()]
+        .sort((left, right) => left[0] - right[0])
+        .map(([, code]) => code)
+        .join("\n"),
+      lang,
+    };
   }
   function buildMarkdown(prFilter?: string): string {
     let out = "# " + TITLE + "\n_" + SUBTITLE + "_\n";
@@ -2881,26 +3306,21 @@ function eventElement(event: Event): UiElement | null {
       if (rev && rev.comments.length) {
         block += "\n**On the " + REVIEWER + " review:**\n";
         for (const c of rev.comments) {
-          const id = pr + " " + c.aid;
-          const s =
-            [state.aiState[id], state.aiReply[id] ? "reply" : ""].filter(Boolean).join(" + ") ||
-            "open";
-          block +=
-            "- [" +
-            s +
-            "] " +
-            c.file +
-            " L" +
-            c.line +
-            " (" +
-            c.severity +
-            ", " +
-            Math.round(c.confidence * 100) +
-            "% confidence) — " +
-            c.body.replace(/\n+/g, " ").trim() +
-            " Rationale: " +
-            c.rationale.replace(/\n+/g, " ").trim() +
-            "\n";
+          const s = findingStatus(pr, c) || "open";
+          block += markdownListItem(
+            "[" +
+              s +
+              "] " +
+              c.file +
+              " L" +
+              c.line +
+              " (" +
+              c.severity +
+              ", " +
+              Math.round(c.confidence * 100) +
+              "% confidence) —",
+            c.body.trim() + "\n\nRationale: " + c.rationale.trim(),
+          );
         }
       }
       const gen = (state.general[pr] || "").trim();
@@ -2932,24 +3352,21 @@ function eventElement(event: Event): UiElement | null {
         const fm = byFile[file];
         const fileAttachments = attachmentMarkdown(attachmentId("file", pr, file, ""), "  ");
         if (fm.note || fileAttachments) {
-          block +=
-            "- **File:**" +
-            (fm.note ? " " + fm.note.replace(/\n+/g, " ").trim() : " Pasted image") +
-            "\n";
+          block += markdownListItem("**File:**", fm.note || "Pasted image");
           if (fileAttachments) block += fileAttachments + "\n";
         }
         fm.lines.sort((a, b) => (parseInt(a.lineno ?? "") || 0) - (parseInt(b.lineno ?? "") || 0));
         for (const c of fm.lines) {
           const lineAttachments = attachmentMarkdown(attachmentId("line", pr, c.file, c.key), "  ");
-          block +=
-            "- **L" +
-            (c.startLineno && c.startLineno !== c.lineno
-              ? c.startLineno + "–" + c.lineno
-              : c.lineno) +
-            "** — " +
-            (c.text ? c.text.replace(/\n+/g, " ").trim() : "Pasted image") +
-            "\n";
-          if (c.code && c.code.trim()) block += "  > `" + c.code.trim().slice(0, 160) + "`\n";
+          const isRange = !!c.startLineno && c.startLineno !== c.lineno;
+          block += markdownListItem(
+            "**L" + (isRange ? c.startLineno + "–" + c.lineno : c.lineno) + "** —",
+            c.text || "Pasted image",
+          );
+          const quoted = isRange
+            ? commentRangeCode(c)
+            : { code: (c.code || "").trim(), lang: fileLanguage(c.pr, c.file) };
+          if (quoted.code.trim()) block += markdownCodeBlock(quoted.code, quoted.lang);
           if (lineAttachments) block += lineAttachments + "\n";
         }
       }
@@ -2957,14 +3374,10 @@ function eventElement(event: Event): UiElement | null {
       if (orphans.length) {
         block += "\n### Orphaned comments\n";
         for (const [, comment] of orphans) {
-          block +=
-            "- **" +
-            comment.file +
-            ":" +
-            (comment.lineno || comment.key) +
-            "** — " +
-            (comment.text || "Pasted image").replace(/\n+/g, " ").trim() +
-            "\n";
+          block += markdownListItem(
+            "**" + comment.file + ":" + (comment.lineno || comment.key) + "** —",
+            comment.text || "Pasted image",
+          );
         }
       }
       if (block.trim()) {
@@ -2986,14 +3399,11 @@ function eventElement(event: Event): UiElement | null {
     if (review?.comments.length) {
       summary += `\n**On the ${REVIEWER} review:**\n`;
       for (const comment of review.comments) {
-        const id = pr + " " + comment.aid;
-        const status =
-          [state.aiState[id], state.aiReply[id] ? "reply" : ""].filter(Boolean).join(" + ") ||
-          "open";
-        summary +=
-          `- [${status}] ${comment.file} L${comment.line} — ` +
-          comment.body.replace(/\n+/g, " ").trim() +
-          "\n";
+        const status = findingStatus(pr, comment) || "open";
+        summary += markdownListItem(
+          `[${status}] ${comment.file} L${comment.line} —`,
+          comment.body.trim(),
+        );
       }
     }
     const general = (state.general[pr] || "").trim();
@@ -3026,12 +3436,12 @@ function eventElement(event: Event): UiElement | null {
       button.textContent = "Copied ✓";
       setTimeout(() => (button.textContent = "Copy comments"), 1800);
     } else {
-      modal.hidden = false;
-      exportText.focus();
+      openDialog(modal, exportText);
       exportText.select();
     }
   });
   document.getElementById("clearReviewBtn").addEventListener("click", () => {
+    if (headerMenu) headerMenu.open = false;
     const confirmed = window.confirm(
       "Clear this review?\n\n" +
         "This removes all comments, pasted images, viewed state, finding decisions, " +
@@ -3050,11 +3460,11 @@ function eventElement(event: Event): UiElement | null {
     exportText.value = buildMarkdown();
     document.getElementById("githubReviewTab").hidden = !GITHUB[activeSection()?.dataset.pr || ""];
     setExportTab("markdown");
-    modal.hidden = false;
+    openDialog(modal);
   });
-  document.getElementById("closeModal").addEventListener("click", () => (modal.hidden = true));
+  document.getElementById("closeModal").addEventListener("click", () => closeDialog(modal));
   modal.addEventListener("click", (e) => {
-    if (e.target === modal) modal.hidden = true;
+    if (e.target === modal) closeDialog(modal);
   });
   document.getElementById("copyBtn").addEventListener("click", async () => {
     if (await copyMarkdown(exportText.value)) {
@@ -3312,10 +3722,169 @@ function eventElement(event: Event): UiElement | null {
         .forEach((d) => d.classList.remove("maximized"));
   });
 
+  // ---- keyboard model ----
+  const shortcutsModal = document.getElementById("shortcutsModal");
+  document.getElementById("shortcutList").innerHTML = SHORTCUTS.map(
+    (shortcut) =>
+      `<dt><kbd>${escAttr(shortcut.keys)}</kbd></dt><dd>${escAttr(shortcut.label)}</dd>`,
+  ).join("");
+  function openShortcuts(): void {
+    if (headerMenu) headerMenu.open = false;
+    openDialog(shortcutsModal, document.getElementById("closeShortcutsModal"));
+  }
+  document.getElementById("shortcutsBtn").addEventListener("click", openShortcuts);
+  document
+    .getElementById("closeShortcutsModal")
+    .addEventListener("click", () => closeDialog(shortcutsModal));
+  shortcutsModal.addEventListener("click", (event) => {
+    if (event.target === shortcutsModal) closeDialog(shortcutsModal);
+  });
+
+  function stickyOffset(): number {
+    const cs = getComputedStyle(document.documentElement);
+    const px = (name: string): number => parseInt(cs.getPropertyValue(name)) || 0;
+    return px("--h-app") + px("--h-tabs") + px("--h-diffhead");
+  }
+  function navigableFiles(): UiElement[] {
+    const sec = activeSection();
+    return sec ? visibleEvidenceFiles(sec) : [];
+  }
+  function inViewport(element: UiElement): boolean {
+    const rect = element.getBoundingClientRect();
+    return rect.height > 0 && rect.bottom > stickyOffset() && rect.top < window.innerHeight;
+  }
+  // The file j/k/v/c act on: the last one navigated to while it is still on
+  // screen, otherwise the first file under the sticky headers.
+  function currentFileElement(files = navigableFiles()): UiElement | undefined {
+    if (currentFile?.isConnected && files.includes(currentFile) && inViewport(currentFile)) {
+      return currentFile;
+    }
+    const offset = stickyOffset();
+    return files.find((file) => {
+      const rect = file.getBoundingClientRect();
+      return rect.height > 0 && rect.bottom > offset + 1;
+    });
+  }
+  function stepFile(step: 1 | -1): void {
+    const files = navigableFiles();
+    if (!files.length) return;
+    const current = currentFileElement(files);
+    const index = current ? files.indexOf(current) : -1;
+    const next = files[Math.max(0, Math.min(files.length - 1, index + step))];
+    if (!next) return;
+    const group = next.closest(".group");
+    if (group) group.classList.remove("collapsed");
+    setCurrentFile(next);
+    scrollFileToTop(next);
+    next.querySelector(".file-path")?.focus({ preventScroll: true });
+  }
+  function commentOnFocusedLine(): void {
+    if (activeRange) {
+      rangeToolbar.querySelector("[data-range-comment]").click();
+      return;
+    }
+    let gutter = hoveredGutter?.isConnected ? hoveredGutter : null;
+    if (gutter && !inViewport(gutter)) gutter = null;
+    if (!gutter) {
+      const file = currentFileElement();
+      if (!file) return;
+      file.classList.remove("collapsed");
+      ensureRendered(file);
+      gutter =
+        file.querySelector(".line-add .gutter[data-key], .line-del .gutter[data-key]") ||
+        file.querySelector(".gutter[data-key]");
+    }
+    if (!gutter) return;
+    lastGutter = gutter;
+    const ta = createCommentRow(gutter, "");
+    if (ta) {
+      ta.focus({ preventScroll: true });
+      ta.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+  }
+  document.addEventListener("keydown", (event) => {
+    if (event.defaultPrevented || event.key === "Escape") return;
+    if (openDialogs.length) return;
+    const target = eventElement(event);
+    const action = shortcutAction({
+      key: event.key,
+      ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey,
+      altKey: event.altKey,
+      targetTag: target?.tagName,
+      targetEditable: target?.isContentEditable,
+      targetType: target?.getAttribute("type") || "",
+    });
+    if (!action) return;
+    event.preventDefault();
+    if (action === "help") openShortcuts();
+    else if (action === "next-file") stepFile(1);
+    else if (action === "previous-file") stepFile(-1);
+    else if (action === "next-finding" || action === "previous-finding") {
+      const step = action === "next-finding" ? "1" : "-1";
+      document.querySelector(`#progressDock [data-finding-step="${step}"]`)?.click();
+    } else if (action === "toggle-viewed") {
+      const file = currentFileElement();
+      const checkbox = file?.querySelector(".viewed-cb");
+      if (!file || !checkbox) return;
+      setCurrentFile(file);
+      checkbox.checked = !checkbox.checked;
+      checkbox.dispatchEvent(new Event("change", { bubbles: true }));
+    } else if (action === "comment") commentOnFocusedLine();
+  });
+
+  // File and group headers: keyboard-operable toggles. The role sits on the
+  // path/title rather than the whole header, which also holds checkboxes and
+  // buttons (an interactive role may not contain other controls).
+  function syncExpanded(container: UiElement): void {
+    const toggle = container.matches(".file")
+      ? container.querySelector(":scope > .file-header .file-path")
+      : container.querySelector(":scope > .group-head .group-title");
+    if (toggle)
+      toggle.setAttribute("aria-expanded", String(!container.classList.contains("collapsed")));
+  }
+  document
+    .querySelectorAll(".file-header .file-path, .group-head .group-title")
+    .forEach((toggle) => {
+      const label = toggle.textContent?.trim() || "";
+      toggle.setAttribute("role", "button");
+      toggle.setAttribute("tabindex", "0");
+      if (toggle.matches(".file-path")) {
+        toggle.title = label;
+        // isolate the path so narrow layouts can truncate it from the left
+        toggle.innerHTML = `<bdi>${escAttr(label)}</bdi>`;
+      }
+      toggle.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        toggle.closest(".file-header, .group-head")?.click();
+      });
+    });
+  document.querySelectorAll(".file, .group").forEach(syncExpanded);
+  new MutationObserver((records) => {
+    for (const record of records) {
+      const element = record.target as UiElement;
+      if (element.matches(".file, .group")) syncExpanded(element);
+    }
+  }).observe(document.getElementById("main"), {
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["class"],
+  });
+  document.getElementById("main").addEventListener("focusin", (event) => {
+    const file = eventElement(event)?.closest(".file");
+    if (file) setCurrentFile(file);
+  });
+
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
-    if (!fileModal.hidden) {
-      closeFileModal();
+    if (closeTopDialog()) {
+      e.preventDefault();
+      return;
+    }
+    if (headerMenu?.open) {
+      headerMenu.open = false;
+      headerMenu.querySelector("summary")?.focus();
       return;
     }
     if (!lb.hidden) {
