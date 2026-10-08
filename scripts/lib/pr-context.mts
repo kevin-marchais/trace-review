@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { parseDiffPaths, preflightPatch } from "./preflight.mjs";
+import { preflightPatch } from "./preflight.mjs";
+import { parseUnifiedDiff } from "./diff-parse.mjs";
 import { detectChangeGroups } from "./change-groups.mjs";
 import type { ChangeGrouping } from "./change-groups.mjs";
 import type { CommandRunner, PatchAnalysis } from "./preflight.mjs";
@@ -104,6 +105,8 @@ export interface GitFacts {
   dirty: boolean;
   status: string[];
   baseRef?: string;
+  /** Commit the diff was taken against (the merge-base for default local reviews). */
+  baseSha?: string;
   headRef?: string;
   diffArgs?: string[];
   diffLabel?: string;
@@ -213,19 +216,63 @@ function normalizePr(raw: RawPullRequest): NormalizedPullRequest {
 }
 
 function deletedFiles(diff: string): Set<string> {
-  const deleted = new Set<string>();
-  let currentPath = "";
-  for (const line of diff.replace(/\r\n?/g, "\n").split("\n")) {
-    const paths = parseDiffPaths(line);
-    if (paths) {
-      currentPath = paths.path;
-      continue;
-    }
-    if (currentPath && (line.startsWith("deleted file mode ") || line === "+++ /dev/null")) {
-      deleted.add(currentPath);
-    }
+  return new Set(
+    parseUnifiedDiff(diff)
+      .filter((file) => file.isDeleted)
+      .map((file) => file.path),
+  );
+}
+
+const GIT_DIFF_ARGS = [
+  "-c",
+  "core.quotePath=false",
+  "diff",
+  "--no-color",
+  "--no-ext-diff",
+  "--no-textconv",
+  "--src-prefix=a/",
+  "--dst-prefix=b/",
+  "--no-relative",
+];
+
+function rejectOption(value: string, label: string): void {
+  if (value.startsWith("-")) {
+    throw new Error(`${label} '${value}' must not start with '-'.`);
   }
-  return deleted;
+}
+
+/** Run `git diff` with a fixed output format regardless of user configuration. */
+function gitDiff(run: CommandRunner, root: string, revisions: readonly string[]): string {
+  revisions.forEach((revision) => rejectOption(revision, "Revision"));
+  return run("git", [...GIT_DIFF_ARGS, "--end-of-options", ...revisions], { cwd: root });
+}
+
+/** Resolve a revision to a commit SHA, rejecting option-like input. */
+function verifyCommit(run: CommandRunner, root: string, revision: string): string {
+  rejectOption(revision, "Revision");
+  return trim(
+    run("git", ["rev-parse", "--verify", "--end-of-options", `${revision}^{commit}`], {
+      cwd: root,
+    }),
+  );
+}
+
+function mergeBase(run: CommandRunner, root: string, left: string, right: string): string {
+  return trim(run("git", ["merge-base", "--end-of-options", left, right], { cwd: root }));
+}
+
+/** Read a working-tree file, skipping symlinks, non-files, and oversized files. */
+function readWorktreeFile(root: string, filePath: string): RemoteFileResult {
+  const rootReal = fs.realpathSync(root);
+  const absolute = path.resolve(rootReal, filePath);
+  const stats = fs.lstatSync(absolute);
+  if (stats.isSymbolicLink() || !stats.isFile()) return { unavailable: "missing" };
+  const relative = path.relative(rootReal, fs.realpathSync(absolute));
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+    return { unavailable: "missing" };
+  }
+  if (stats.size > MAX_FULL_FILE_BYTES) return { unavailable: "too-large" };
+  return { content: fs.readFileSync(absolute, "utf8") };
 }
 
 function githubContent(
@@ -399,19 +446,28 @@ export function collectFileContents(
         }
         content = remote.content;
       } else if (revision === "base") {
+        const baseRevision = context.git.baseSha || context.git.baseRef || "HEAD";
         const source =
-          context.git.baseRef === "INDEX"
-            ? `:${file.oldPath}`
-            : `${context.git.baseRef}:${file.oldPath}`;
-        content = run("git", ["show", source], {
+          context.git.baseRef === "INDEX" ? `:${file.oldPath}` : `${baseRevision}:${file.oldPath}`;
+        content = run("git", ["show", "--end-of-options", source], {
           cwd: context.repository.root,
         });
       } else if (context.git.headRef && context.git.headRef !== "WORKTREE") {
-        content = run("git", ["show", `${context.git.headRef}:${file.path}`], {
-          cwd: context.repository.root,
-        });
+        content = run(
+          "git",
+          [
+            "show",
+            "--end-of-options",
+            `${context.git.headSha || context.git.headRef}:${file.path}`,
+          ],
+          { cwd: context.repository.root },
+        );
       } else {
-        content = fs.readFileSync(path.join(context.repository.root, file.path), "utf8");
+        const local = readWorktreeFile(context.repository.root, file.path);
+        if (local.content === undefined) {
+          return { path: file.path, revision, unavailable: local.unavailable || "missing" };
+        }
+        content = local.content;
       }
     } catch {
       return { path: file.path, revision, unavailable: "missing" };
@@ -640,12 +696,15 @@ function collectLocalContext(
   run: CommandRunner,
   collectionDiagnostics: ContextDiagnostic[] = [],
 ): CollectedContext {
+  const root = facts.repository.root;
   if (options.revisions !== undefined) {
     const revisions = options.revisions;
-    const diff = run("git", ["diff", "--binary", "--no-ext-diff", ...revisions], {
-      cwd: facts.repository.root,
-    });
+    if (revisions.length > 2) {
+      throw new Error("Quick revision comparisons accept at most two Git revisions.");
+    }
+    revisions.forEach((revision) => rejectOption(revision, "Revision"));
     let baseRef = "INDEX";
+    let baseSha: string | undefined;
     let headRef = "WORKTREE";
     let diffLabel = "Working tree changes";
     if (revisions.length === 1) {
@@ -653,28 +712,25 @@ function collectLocalContext(
       if (range) {
         const left = range[1] || "HEAD";
         const right = range[3] || "HEAD";
-        baseRef =
-          range[2] === "..."
-            ? trim(run("git", ["merge-base", left, right], { cwd: facts.repository.root }))
-            : left;
+        const leftSha = verifyCommit(run, root, left);
+        const rightSha = verifyCommit(run, root, right);
+        baseRef = range[2] === "..." ? mergeBase(run, root, leftSha, rightSha) : left;
+        baseSha = range[2] === "..." ? baseRef : leftSha;
         headRef = right;
         diffLabel = `${left}${range[2]}${right}`;
       } else {
         baseRef = revisions[0];
+        baseSha = verifyCommit(run, root, baseRef);
         diffLabel = `${revisions[0]} ↔ working tree`;
       }
     } else if (revisions.length === 2) {
       [baseRef, headRef] = revisions;
+      baseSha = verifyCommit(run, root, baseRef);
       diffLabel = `${baseRef} ↔ ${headRef}`;
-    } else if (revisions.length > 2) {
-      throw new Error("Quick revision comparisons accept at most two Git revisions.");
     }
     let headSha = facts.git.headSha;
-    if (headRef !== "WORKTREE") {
-      headSha = trim(
-        run("git", ["rev-parse", `${headRef}^{commit}`], { cwd: facts.repository.root }),
-      );
-    }
+    if (headRef !== "WORKTREE") headSha = verifyCommit(run, root, headRef);
+    const diff = gitDiff(run, root, revisions);
     const preflight = preflightPatch(diff, run, facts.repository.root);
     const context: CollectedContext = {
       schemaVersion: 1,
@@ -689,6 +745,7 @@ function collectLocalContext(
         ...facts.git,
         headSha,
         baseRef,
+        ...(baseSha ? { baseSha } : {}),
         headRef,
         diffArgs: revisions,
         diffLabel,
@@ -721,10 +778,23 @@ function collectLocalContext(
     : baseRef;
   if (facts.git.branch === defaultBranch) baseRef = "HEAD";
 
-  const diff = run("git", ["diff", "--binary", "--no-ext-diff", baseRef], {
-    cwd: facts.repository.root,
-  });
-  const preflight = preflightPatch(diff, run, facts.repository.root);
+  // Review only this branch's work: diff the working tree against the point
+  // where the branch left the base, not against the base's current tip.
+  const baseTip = verifyCommit(run, root, baseRef);
+  let baseSha = baseTip;
+  if (baseRef !== "HEAD") {
+    try {
+      baseSha = mergeBase(run, root, baseTip, "HEAD");
+    } catch (error: unknown) {
+      collectionDiagnostics.push({
+        level: "warning",
+        code: "merge-base-unavailable",
+        message: `Could not find a merge-base with '${baseRef}'; diffing against its tip instead: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  }
+  const diff = gitDiff(run, root, [baseSha]);
+  const preflight = preflightPatch(diff, run, root);
   const context: CollectedContext = {
     schemaVersion: 1,
     source: "local",
@@ -734,7 +804,7 @@ function collectLocalContext(
       reason,
     },
     repository: facts.repository,
-    git: { ...facts.git, baseRef },
+    git: { ...facts.git, baseRef, baseSha },
     pullRequest: null,
     diff,
     preflight,
@@ -744,6 +814,44 @@ function collectLocalContext(
   };
   context.validation = validateContext(context);
   return context;
+}
+
+/** Compute a PR diff locally when GitHub refuses to serve it (e.g. HTTP 406, too large). */
+function localPullRequestDiff(
+  root: string,
+  pullRequest: NormalizedPullRequest,
+  owner: string | undefined,
+  name: string | undefined,
+  run: CommandRunner,
+): string {
+  if (
+    !owner ||
+    !name ||
+    !/^[\w.-]+$/.test(owner) ||
+    !/^[\w.-]+$/.test(name) ||
+    !/^[0-9a-f]{7,64}$/i.test(pullRequest.baseSha) ||
+    !/^[0-9a-f]{7,64}$/i.test(pullRequest.headSha)
+  ) {
+    throw new Error(
+      "Cannot compute the pull request diff locally without its repository and SHAs.",
+    );
+  }
+  run(
+    "git",
+    [
+      "fetch",
+      "--no-tags",
+      "--quiet",
+      "--end-of-options",
+      `https://github.com/${owner}/${name}.git`,
+      `refs/pull/${pullRequest.number}/head`,
+      pullRequest.baseSha,
+    ],
+    { cwd: root },
+  );
+  const base = verifyCommit(run, root, pullRequest.baseSha);
+  const head = verifyCommit(run, root, pullRequest.headSha);
+  return gitDiff(run, root, [`${base}...${head}`]);
 }
 
 export function collectPrContext(options: CollectOptions, run: CommandRunner): CollectedContext {
@@ -756,7 +864,10 @@ export function collectPrContext(options: CollectOptions, run: CommandRunner): C
   }
 
   const viewArgs = ["pr", "view"];
-  if (mode === "explicit") viewArgs.push(selection);
+  if (mode === "explicit") {
+    rejectOption(selection, "Pull request selector");
+    viewArgs.push(selection);
+  }
   viewArgs.push("--json", PR_FIELDS);
   let raw: RawPullRequest;
   try {
@@ -813,15 +924,31 @@ export function collectPrContext(options: CollectOptions, run: CommandRunner): C
     });
   }
   const diffSelector = mode === "explicit" ? selection : String(pullRequest.number);
-  const diff = run("gh", ["pr", "diff", diffSelector], {
-    cwd: facts.repository.root,
-  });
+  let diff: string;
+  try {
+    diff = run("gh", ["pr", "diff", diffSelector], { cwd: facts.repository.root });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/\b406\b|too[_ ]large|too many|exceed/i.test(message)) throw error;
+    diff = localPullRequestDiff(facts.repository.root, pullRequest, repoOwner, repoName, run);
+    collectionDiagnostics.push({
+      level: "warning",
+      code: "pr-diff-fetched-locally",
+      message: `GitHub could not serve the pull request diff, so it was computed locally from refs/pull/${pullRequest.number}/head: ${message}`,
+    });
+  }
   const preflight = preflightPatch(diff, run, facts.repository.root);
   const context: CollectedContext = {
     schemaVersion: 1,
     source: "github",
     selection: { mode, requested: selection },
-    repository: facts.repository,
+    // The PR's base repository (from its URL) is the review target, even when
+    // the local clone's origin is a fork.
+    repository: {
+      ...facts.repository,
+      ...(repoOwner ? { owner: repoOwner } : {}),
+      ...(repoName ? { name: repoName } : {}),
+    },
     git: facts.git,
     pullRequest,
     diff,

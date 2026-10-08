@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { parseDiffPaths } from "./preflight.mjs";
+import { parseUnifiedDiff } from "./diff-parse.mjs";
 
 export type EditSide = "add" | "delete";
 
@@ -149,63 +149,29 @@ function patternId(signature: string): string {
 
 function parseEditAtoms(patch: string): EditAtom[] {
   const atoms: EditAtom[] = [];
-  const lines = String(patch || "")
-    .replace(/\r\n?/g, "\n")
-    .split("\n");
-  let file = "";
-  let hunk = -1;
-  let oldLine = 0;
-  let newLine = 0;
-  let fileStatus: EditAtom["fileStatus"] = "modified";
-
-  for (const raw of lines) {
-    const paths = parseDiffPaths(raw);
-    if (paths) {
-      file = paths.path.replaceAll("\\", "/");
-      hunk = -1;
-      fileStatus = "modified";
-      continue;
-    }
-    if (raw.startsWith("new file mode ") || raw === "--- /dev/null") {
-      fileStatus = "added";
-      continue;
-    }
-    if (raw.startsWith("deleted file mode ") || raw === "+++ /dev/null") {
-      fileStatus = "deleted";
-      continue;
-    }
-    const header = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw);
-    if (header) {
-      oldLine = Number(header[1]);
-      newLine = Number(header[2]);
-      hunk++;
-      continue;
-    }
-    if (!file || hunk < 0) continue;
-    if (raw.startsWith("+") && !raw.startsWith("+++")) {
-      atoms.push({
-        id: `${file}#h${hunk}:a${newLine}`,
-        file,
-        hunk,
-        side: "add",
-        line: newLine++,
-        text: raw.slice(1),
-        fileStatus,
-      });
-    } else if (raw.startsWith("-") && !raw.startsWith("---")) {
-      atoms.push({
-        id: `${file}#h${hunk}:d${oldLine}`,
-        file,
-        hunk,
-        side: "delete",
-        line: oldLine++,
-        text: raw.slice(1),
-        fileStatus,
-      });
-    } else if (raw.startsWith(" ")) {
-      oldLine++;
-      newLine++;
-    }
+  for (const parsed of parseUnifiedDiff(String(patch || ""))) {
+    const file = parsed.path.replaceAll("\\", "/");
+    const fileStatus: EditAtom["fileStatus"] = parsed.isDeleted
+      ? "deleted"
+      : parsed.isNew
+        ? "added"
+        : "modified";
+    parsed.hunks.forEach((hunk, hunkIndex) => {
+      for (const line of hunk.lines) {
+        if (line.kind === "ctx") continue;
+        const side: EditSide = line.kind === "add" ? "add" : "delete";
+        const lineNumber = (line.kind === "add" ? line.newNo : line.oldNo) ?? 0;
+        atoms.push({
+          id: `${file}#h${hunkIndex}:${line.kind === "add" ? "a" : "d"}${lineNumber}`,
+          file,
+          hunk: hunkIndex,
+          side,
+          line: lineNumber,
+          text: line.text,
+          fileStatus,
+        });
+      }
+    });
   }
   return atoms;
 }

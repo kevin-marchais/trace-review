@@ -11,6 +11,7 @@ import {
   type GithubPublicationContext,
   type GithubReviewRequest,
 } from "./lib/github-review.mjs";
+import { requiredValue } from "./lib/cli.mjs";
 
 interface Args {
   plan?: string;
@@ -22,7 +23,7 @@ function parseArgs(argv: readonly string[]): Args {
   const args: Args = { confirm: false, help: false };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (arg === "--plan") args.plan = argv[++index];
+    if (arg === "--plan") args.plan = requiredValue(argv, index++, arg);
     else if (arg === "--confirm") args.confirm = true;
     else if (arg === "--help" || arg === "-h") args.help = true;
     else throw new Error(`Unknown argument '${arg}'.`);

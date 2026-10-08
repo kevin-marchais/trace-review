@@ -821,3 +821,70 @@ test("large reviews expose accessible search and combinable file filters", (t) =
   assert.match(html, /data-nav-select="group"/);
   assert.match(html, /data-nav-results/);
 });
+
+function reviewData(html) {
+  const match = /<script id="review-data" type="application\/json">([\s\S]*?)<\/script>/.exec(html);
+  assert.ok(match, "review data block is present");
+  return Object.values(JSON.parse(match[1]));
+}
+
+test("rendered diffs keep header-like content, decoded paths, and placeholder text intact", (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "trace-review-tricky-"));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const crPatch =
+    "diff --git a/crlf.txt b/crlf.txt\n--- a/crlf.txt\n+++ b/crlf.txt\n@@ -1,2 +1,2 @@\n" +
+    "-line one\r\n-bare\rcr\n+line one\n+bare\rcr\n";
+  fs.writeFileSync(
+    path.join(tempDir, "change.patch"),
+    fs.readFileSync(path.join(fixtures, "tricky-paths.patch"), "utf8") + crPatch,
+  );
+  const reviewId = 'x</script><script>alert(1)//"';
+  fs.writeFileSync(
+    path.join(tempDir, "spec.json"),
+    JSON.stringify({
+      schemaVersion: 1,
+      mode: "workspace",
+      title: "Tricky {{SECTIONS}} $&",
+      reviewId,
+      prs: [{ title: "Tricky", diffFile: "change.patch" }],
+    }),
+  );
+  const out = path.join(tempDir, "review.html");
+
+  const result = build(path.join(tempDir, "spec.json"), out);
+
+  assert.equal(result.status, 0, result.stderr);
+  const html = fs.readFileSync(out, "utf8");
+  const files = reviewData(html);
+  assert.deepEqual(
+    files.map((file) => [file.oldPath, file.path, file.renamed]),
+    [
+      ["query.sql", "query.sql", false],
+      ["café.txt", "café.txt", false],
+      ["x b/y.txt", "z b/w.txt", true],
+      ["crlf.txt", "crlf.txt", false],
+    ],
+  );
+  assert.deepEqual(
+    files[0].hunks[0].rows.map((row) => [row.t, row.c]),
+    [
+      ["c", "select 1;"],
+      ["d", "-- comment"],
+      ["a", "++ b;"],
+      ["c", "select '{{AIREVIEW}} {{REVIEW_ID}} {{TITLE}} $& </script>';"],
+    ],
+  );
+  assert.deepEqual(
+    files[3].hunks[0].rows.map((row) => row.c),
+    ["line one\r", "bare\rcr", "line one", "bare\rcr"],
+  );
+  assert.match(html, /<title>Tricky \{\{SECTIONS\}\} \$&amp;<\/title>/);
+  assert.ok(
+    html.includes(`const REVIEW_ID = ${JSON.stringify(reviewId).replace(/</g, "\\u003c")};`),
+  );
+  assert.doesNotMatch(html, /x<\/script><script>alert/);
+  const aiReview = /<script id="ai-review-data" type="application\/json">([\s\S]*?)<\/script>/.exec(
+    html,
+  );
+  assert.deepEqual(JSON.parse(aiReview[1]), {});
+});

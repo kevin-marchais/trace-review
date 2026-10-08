@@ -326,3 +326,30 @@ test("indexes repeated changes without an all-pairs performance cliff", () => {
   assert.equal(discovery.patterns[0].support, 1_000);
   assert.ok(duration < 1_000, `repeated-change discovery took ${duration.toFixed(0)}ms`);
 });
+
+test("header-like deleted and added lines become edit atoms", () => {
+  const patch = ["a.sql", "b.sql", "c.sql"]
+    .map((file) =>
+      [
+        `diff --git a/${file} b/${file}`,
+        `--- a/${file}`,
+        `+++ b/${file}`,
+        "@@ -1,2 +1,2 @@",
+        " select 1;",
+        "--- legacy",
+        "+++ counter;",
+        "",
+      ].join("\n"),
+    )
+    .join("");
+
+  const discovery = discoverRepeatedChanges(patch);
+
+  assert.deepEqual(
+    discovery.atoms.filter((atom) => atom.file === "a.sql").map((atom) => [atom.id, atom.text]),
+    [
+      ["a.sql#h0:d2", "-- legacy"],
+      ["a.sql#h0:a2", "++ counter;"],
+    ],
+  );
+});

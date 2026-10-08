@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 import { createHash } from "node:crypto";
-import { errorMessage, parseJson } from "./lib/cli.mjs";
+import { errorMessage, parseJson, requiredValue } from "./lib/cli.mjs";
 import { detectChangeGroups } from "./lib/change-groups.mjs";
 import { parseDetectorRuleSet } from "./lib/repeated-changes.mjs";
 
@@ -135,15 +135,15 @@ function parseArgs(argv: readonly string[]): Args {
     first === "quick" || first === "prepare" || first === "refine" || first === "finish" ? 1 : 0;
   for (let index = optionStart; index < argv.length; index++) {
     const arg = argv[index];
-    if (arg === "--repo") args.repo = argv[++index];
-    else if (arg === "--pr") args.pr = argv[++index];
-    else if (arg === "--mode") args.mode = normalizeMode(argv[++index]);
-    else if (arg === "--base") args.base = argv[++index];
-    else if (arg === "--dir") args.dir = argv[++index];
-    else if (arg === "--input") args.input = argv[++index];
-    else if (arg === "--result") args.result = argv[++index];
-    else if (arg === "--rules") args.rules = argv[++index];
-    else if (arg === "--out") args.out = argv[++index];
+    if (arg === "--repo") args.repo = requiredValue(argv, index++, arg, usage);
+    else if (arg === "--pr") args.pr = requiredValue(argv, index++, arg, usage);
+    else if (arg === "--mode") args.mode = normalizeMode(requiredValue(argv, index++, arg, usage));
+    else if (arg === "--base") args.base = requiredValue(argv, index++, arg, usage);
+    else if (arg === "--dir") args.dir = requiredValue(argv, index++, arg, usage);
+    else if (arg === "--input") args.input = requiredValue(argv, index++, arg, usage);
+    else if (arg === "--result") args.result = requiredValue(argv, index++, arg, usage);
+    else if (arg === "--rules") args.rules = requiredValue(argv, index++, arg, usage);
+    else if (arg === "--out") args.out = requiredValue(argv, index++, arg, usage);
     else if (arg === "--explicit") args.explicit = true;
     else if (arg === "--open") args.open = true;
     else if (arg === "--no-open") args.open = false;
@@ -232,6 +232,12 @@ function reserveUniqueReviewPath(preferredPath: string): {
 
 function ensureReviewExcluded(repositoryRoot: string, outputDir: string): void {
   if (path.resolve(outputDir) !== path.join(path.resolve(repositoryRoot), ".review")) return;
+  // Leave the exclude file alone when .gitignore (or anything else) already ignores it.
+  const ignored = spawnSync("git", ["check-ignore", "--quiet", "--", ".review/"], {
+    cwd: repositoryRoot,
+    windowsHide: true,
+  });
+  if (ignored.status === 0) return;
   const result = spawnSync("git", ["rev-parse", "--git-path", "info/exclude"], {
     cwd: repositoryRoot,
     encoding: "utf8",
@@ -508,6 +514,31 @@ function refine(args: Args): void {
   console.log(`Updated ${inputPath}`);
 }
 
+// Review IDs key browser storage, so they must change whenever the compared
+// commits change; working-tree reviews get their own marker.
+function reviewContentKey(contextPath: string, fallbackHeadSha: string): string {
+  let context: {
+    source?: string;
+    git?: { baseSha?: string; baseRef?: string; headSha?: string; headRef?: string };
+    pullRequest?: { baseSha?: string; headSha?: string } | null;
+  } = {};
+  try {
+    context = parseJson(fs.readFileSync(contextPath, "utf8")) as typeof context;
+  } catch {}
+  const github = context.source === "github";
+  const baseSha = github
+    ? context.pullRequest?.baseSha || ""
+    : context.git?.baseSha || context.git?.baseRef || "";
+  const headSha = github
+    ? context.pullRequest?.headSha || fallbackHeadSha
+    : context.git?.headSha || fallbackHeadSha;
+  const worktree = !github && (!context.git?.headRef || context.git.headRef === "WORKTREE");
+  return createHash("sha256")
+    .update([baseSha, headSha, worktree ? "worktree" : "commit"].join("\0"))
+    .digest("hex")
+    .slice(0, 12);
+}
+
 function finish(args: Args): void {
   if (!args.input) usage("finish requires --input");
   if (!args.result) usage("finish requires --result");
@@ -575,9 +606,11 @@ function finish(args: Args): void {
     schemaVersion: 1,
     mode: input.mode,
     title: `Review: ${target.title}`,
-    reviewId: target.number
-      ? `${reviewIdentity}-pr-${target.number}`
-      : `${reviewIdentity}-${target.branch || "local"}`,
+    reviewId: `${
+      target.number
+        ? `${reviewIdentity}-pr-${target.number}`
+        : `${reviewIdentity}-${target.branch || "local"}`
+    }-${reviewContentKey(resolveArtifact("context"), target.headSha)}`,
     prs: [
       {
         id: prId,

@@ -281,3 +281,37 @@ test(
     assert.ok(fs.statSync(path.join(reviewDir, "review-main-feature-2.html")).size > 0);
   },
 );
+
+test(
+  "review IDs follow the compared commits and an existing .gitignore rule is respected",
+  { timeout: 20_000 },
+  (t) => {
+    const repository = fs.mkdtempSync(path.join(os.tmpdir(), "trace-review-identity-"));
+    t.after(() => fs.rmSync(repository, { recursive: true, force: true }));
+
+    run("git", ["init", "-b", "main"], repository);
+    run("git", ["config", "user.email", "test@example.com"], repository);
+    run("git", ["config", "user.name", "Trace Review Test"], repository);
+    fs.writeFileSync(path.join(repository, ".gitignore"), ".review/\n");
+    fs.writeFileSync(path.join(repository, "app.js"), "export const value = 1;\n");
+    run("git", ["add", "."], repository);
+    run("git", ["commit", "-m", "Initial"], repository);
+    const reviewId = (): string => {
+      run(process.execPath, [cli, "--repo", repository, "--no-open"], repository);
+      return JSON.parse(fs.readFileSync(path.join(repository, ".review", "spec.json"), "utf8"))
+        .reviewId;
+    };
+
+    fs.writeFileSync(path.join(repository, "app.js"), "export const value = 2;\n");
+    const first = reviewId();
+    run("git", ["commit", "-am", "Second"], repository);
+    fs.writeFileSync(path.join(repository, "app.js"), "export const value = 3;\n");
+    const second = reviewId();
+
+    assert.match(first, /-[0-9a-f]{12}$/);
+    assert.notEqual(first, second);
+    const exclude = path.join(repository, ".git", "info", "exclude");
+    const excluded = fs.existsSync(exclude) ? fs.readFileSync(exclude, "utf8") : "";
+    assert.doesNotMatch(excluded, /^\.review\/$/m);
+  },
+);

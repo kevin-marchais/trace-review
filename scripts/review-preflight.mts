@@ -5,6 +5,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { preflightPatch } from "./lib/preflight.mjs";
 import type { CommandRunner, RunOptions } from "./lib/preflight.mjs";
+import { requiredValue } from "./lib/cli.mjs";
 
 interface Args {
   diff?: string;
@@ -22,8 +23,8 @@ function parseArgs(argv: readonly string[]): Args {
   const args: Args = {};
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index];
-    if (arg === "--diff") args.diff = argv[++index];
-    else if (arg === "--out") args.out = argv[++index];
+    if (arg === "--diff") args.diff = requiredValue(argv, index++, arg, usage);
+    else if (arg === "--out") args.out = requiredValue(argv, index++, arg, usage);
     else if (arg === "--help" || arg === "-h") args.help = true;
     else usage(`Unknown option: ${arg}`);
   }

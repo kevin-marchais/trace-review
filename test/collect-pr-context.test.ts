@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import test from "node:test";
@@ -11,6 +12,14 @@ import {
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const patch = fs.readFileSync(path.join(root, "test", "fixtures", "mixed.patch"), "utf8");
+const GIT_DIFF =
+  "git -c core.quotePath=false diff --no-color --no-ext-diff --no-textconv --src-prefix=a/ --dst-prefix=b/ --no-relative --end-of-options";
+const BASE_TIP = "1111111111111111111111111111111111111111";
+const MERGE_BASE = "2222222222222222222222222222222222222222";
+const originMainBase = {
+  "git rev-parse --verify --end-of-options origin/main^{commit}": `${BASE_TIP}\n`,
+  [`git merge-base --end-of-options ${BASE_TIP} HEAD`]: `${MERGE_BASE}\n`,
+};
 
 function fakeRunner(responses) {
   const calls = [];
@@ -175,7 +184,8 @@ test("none mode intentionally skips GitHub and collects the local branch diff", 
     "git remote get-url origin": "https://github.com/acme/widgets.git\n",
     "git status --short --untracked-files=normal": " M src/app.js\n",
     "git symbolic-ref --quiet --short refs/remotes/origin/HEAD": "origin/main\n",
-    "git diff --binary --no-ext-diff origin/main": patch,
+    ...originMainBase,
+    [`${GIT_DIFF} ${MERGE_BASE}`]: patch,
     "git apply --numstat -": "1\t0\tsrc/app.js\n1\t1\tpackage-lock.json\n-\t-\tassets/logo.png\n",
   });
 
@@ -189,6 +199,8 @@ test("none mode intentionally skips GitHub and collects the local branch diff", 
   });
   assert.equal(context.pullRequest, null);
   assert.equal(context.git.baseRef, "origin/main");
+  assert.equal(context.git.baseSha, MERGE_BASE);
+  assert.ok(run.calls.includes(`${GIT_DIFF} ${MERGE_BASE}`));
   assert.equal(context.git.dirty, true);
   assert.equal(context.preflight.totals.files, 3);
   assert.equal(
@@ -213,9 +225,10 @@ test("whole-file collection uses the base version for a deleted file", () => {
     "git rev-parse HEAD": "abc123\n",
     "git remote get-url origin": "https://github.com/acme/widgets.git\n",
     "git status --short --untracked-files=normal": " D src/old.js\n",
-    "git diff --binary --no-ext-diff origin/main": deletedPatch,
+    ...originMainBase,
+    [`${GIT_DIFF} ${MERGE_BASE}`]: deletedPatch,
     "git apply --numstat -": "0\t1\tsrc/old.js\n",
-    "git show origin/main:src/old.js": "export const old = true;\n",
+    [`git show --end-of-options ${MERGE_BASE}:src/old.js`]: "export const old = true;\n",
   });
 
   const context = collectPrContext(
@@ -312,7 +325,8 @@ test("auto mode falls back to local context when the branch has no pull request"
     "gh pr view --json number,url,title,body,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,labels,statusCheckRollup,reviews,comments":
       new Error("no pull requests found for branch"),
     "git symbolic-ref --quiet --short refs/remotes/origin/HEAD": "origin/main\n",
-    "git diff --binary --no-ext-diff origin/main": patch,
+    ...originMainBase,
+    [`${GIT_DIFF} ${MERGE_BASE}`]: patch,
     "git apply --numstat -": "1\t0\tsrc/app.js\n1\t1\tpackage-lock.json\n-\t-\tassets/logo.png\n",
   });
 
@@ -334,7 +348,8 @@ test("auto mode warns when GitHub context is unavailable", () => {
     "gh pr view --json number,url,title,body,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,labels,statusCheckRollup,reviews,comments":
       new Error("Could not run 'gh': spawn gh ENOENT"),
     "git symbolic-ref --quiet --short refs/remotes/origin/HEAD": "origin/main\n",
-    "git diff --binary --no-ext-diff origin/main": patch,
+    ...originMainBase,
+    [`${GIT_DIFF} ${MERGE_BASE}`]: patch,
     "git apply --numstat -": "1\t0\tsrc/app.js\n1\t1\tpackage-lock.json\n-\t-\tassets/logo.png\n",
   });
 
@@ -370,6 +385,8 @@ test("explicit mode passes a pull request URL to GitHub selection", () => {
 
   assert.deepEqual(context.selection, { mode: "explicit", requested: selector });
   assert.equal(context.pullRequest.number, 42);
+  assert.equal(context.repository.owner, "other");
+  assert.equal(context.repository.name, "project");
   assert.equal(
     run.calls.some((call) => call.startsWith(`gh pr view ${selector} `)),
     true,
@@ -450,4 +467,98 @@ test("validation rejects malformed entries in required PR collections", () => {
   assert.equal(validation.valid, false);
   assert.equal(validation.diagnostics[0].code, "invalid-field-type");
   assert.equal(validation.diagnostics[0].path, "pullRequest.checks[0]");
+});
+
+const localFacts = {
+  "git rev-parse --show-toplevel": "C:/work/widgets\n",
+  "git branch --show-current": "feature/widgets\n",
+  "git rev-parse HEAD": "abc123\n",
+  "git remote get-url origin": "https://github.com/fork-owner/widgets.git\n",
+  "git status --short --untracked-files=normal": "",
+};
+
+test("a pull request diff too large for GitHub is computed locally from the PR refs", () => {
+  const baseSha = "a".repeat(40);
+  const headSha = "b".repeat(40);
+  const run = fakeRunner({
+    ...localFacts,
+    "git apply --numstat -": "1\t0\tsrc/app.js\n1\t1\tpackage-lock.json\n-\t-\tassets/logo.png\n",
+    "gh pr view 42 --json number,url,title,body,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,labels,statusCheckRollup,reviews,comments": `${JSON.stringify({ ...prJson, baseRefOid: baseSha, headRefOid: headSha })}\n`,
+    "gh api --paginate --slurp repos/acme/widgets/pulls/42/comments": "[]\n",
+    "gh pr diff 42": new Error(
+      "HTTP 406: Sorry, the diff exceeded the maximum number of files (300). (too_large)",
+    ),
+    [`git fetch --no-tags --quiet --end-of-options https://github.com/acme/widgets.git refs/pull/42/head ${baseSha}`]:
+      "",
+    [`git rev-parse --verify --end-of-options ${baseSha}^{commit}`]: `${baseSha}\n`,
+    [`git rev-parse --verify --end-of-options ${headSha}^{commit}`]: `${headSha}\n`,
+    [`${GIT_DIFF} ${baseSha}...${headSha}`]: patch,
+  });
+
+  const context = collectPrContext({ repo: "C:/work/widgets", pr: "42" }, run);
+
+  assert.equal(context.diff, patch);
+  assert.equal(context.repository.owner, "acme");
+  assert.equal(context.validation.valid, true);
+  assert.equal(context.collectionDiagnostics.at(-1).code, "pr-diff-fetched-locally");
+});
+
+test("revisions and bases that look like options are rejected before running git diff", () => {
+  for (const options of [
+    { pr: "none", revisions: ["--output=/tmp/owned"] },
+    { pr: "none", base: "-p" },
+  ]) {
+    const run = fakeRunner(localFacts);
+    assert.throws(
+      () => collectPrContext({ repo: "C:/work/widgets", ...options }, run),
+      /must not start with '-'/,
+    );
+    assert.equal(
+      run.calls.some((call) => call.includes(" diff ")),
+      false,
+    );
+  }
+});
+
+test("working-tree file collection skips symlinks instead of following them", (t) => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "trace-review-symlink-"));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "trace-review-outside-"));
+  t.after(() => {
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  });
+  fs.writeFileSync(path.join(outside, "secret.txt"), "secret\n");
+  try {
+    fs.symlinkSync(path.join(outside, "secret.txt"), path.join(repo, "link.txt"), "file");
+  } catch {
+    t.skip("symlinks are not available on this system");
+    return;
+  }
+  fs.writeFileSync(path.join(repo, "plain.txt"), "plain\n");
+  const file = (filePath) => ({
+    path: filePath,
+    oldPath: filePath,
+    additions: 1,
+    deletions: 0,
+    binary: false,
+    generated: false,
+    type: "other",
+  });
+  const context = {
+    source: "local",
+    repository: { root: repo },
+    git: { headSha: "abc123", baseRef: "HEAD", headRef: "WORKTREE" },
+    pullRequest: null,
+    diff: "",
+    preflight: { files: [file("link.txt"), file("plain.txt")] },
+  };
+
+  const bundle = collectFileContents(context, () => {
+    throw new Error("unexpected command");
+  });
+
+  assert.deepEqual(bundle.files, [
+    { path: "link.txt", revision: "head", unavailable: "missing" },
+    { path: "plain.txt", revision: "head", content: "plain\n" },
+  ]);
 });

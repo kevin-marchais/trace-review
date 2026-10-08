@@ -1,5 +1,5 @@
 import path from "node:path";
-import { decodeGitPath, parseDiffPaths } from "./preflight.mjs";
+import { parseUnifiedDiff } from "./diff-parse.mjs";
 import {
   discoverRepeatedChanges,
   type DetectorRule,
@@ -117,17 +117,18 @@ const CONFIG_RE =
   /(^|\/)(cmakelists\.txt|makefile|dockerfile|[^/]+\.(cmake|ya?ml|toml|json|ini|cfg))$/i;
 const TEST_RE = /(^|\/)(__tests__|tests?|specs?)(\/|$)|\.(test|spec)\.[^.]+$/i;
 const IMPORT_RE =
-  /^\s*(#\s*include\b|import\b|export\s+.+\s+from\b|from\s+\S+\s+import\b|require\s*\(|using\s+[\w:]+|use\s+[\w:]+|mod\s+\w+)/;
+  /^\s*(#\s*include\b|import\b(?!\s*[(.])|export\s+.+\s+from\b|from\s+\S+\s+import\b|(?:(?:const|let|var)\s+[\w${},:\s]+=\s*)?require\s*\(\s*(["'`])[^"'`]+\2\s*\)\s*;?\s*$|using\s+[\w:]+|use\s+[\w:]+|mod\s+\w+)/;
+const INDENT_SENSITIVE_RE =
+  /(^|\/)(makefile|gnumakefile|[^/]+\.(py|pyi|pyw|ya?ml|mk|pug|jade|haml|slim|sass|styl|coffee|nim|hs|elm|fs|fsx))$/i;
 
 function normalizePath(value: string | null | undefined): string {
   return String(value || "").replaceAll("\\", "/");
 }
 
-function parseRange(start: string, count: string | undefined): LineRange {
-  const length = count === undefined ? 1 : Number(count);
+function parseRange(start: number, length: number): LineRange {
   return {
-    start: Number(start),
-    end: length === 0 ? Number(start) : Number(start) + length - 1,
+    start,
+    end: length === 0 ? start : start + length - 1,
     count: length,
   };
 }
@@ -141,85 +142,20 @@ export function parsePatchChanges(text: string, preflight: PreflightLike = {}): 
     (preflight.files || []).map((file) => [normalizePath(file.path), file]),
   );
   const changes: PatchChange[] = [];
-  const lines = String(text || "")
-    .replace(/\r\n?/g, "\n")
-    .split("\n");
-  let file: string | null = null;
-  let oldPath: string | null = null;
-  let hunk: PatchChange | null = null;
-  let hunkIndex = -1;
-  let binary = false;
-  let renamed = false;
-  let oldLine = 0;
-  let newLine = 0;
-
-  const pushHunk = () => {
-    if (!hunk) return;
-    changes.push(hunk);
-    hunk = null;
-  };
-  const pushMetadata = () => {
-    pushHunk();
-    if (!file || changes.some((change) => change.file === file)) return;
+  for (const parsed of parseUnifiedDiff(String(text || ""))) {
+    const file = normalizePath(parsed.path);
+    const oldFile = normalizePath(parsed.oldPath);
+    const renamed = oldFile !== file;
     const facts = filesByPath.get(file);
-    changes.push({
-      id: `${file}#meta`,
-      file,
-      oldFile: oldPath || file,
-      hunk: null,
-      header: binary ? "Binary change" : renamed ? "Rename metadata" : "Metadata-only change",
-      oldRange: null,
-      newRange: null,
-      hunks: [],
-      rows: [],
-      added: [],
-      deleted: [],
-      binary: binary || Boolean(facts?.binary),
-      generated: Boolean(facts?.generated),
-      fileType: facts?.type ?? "other",
-      renamed,
-    });
-  };
-
-  for (const line of lines) {
-    let match;
-    const diffPaths = parseDiffPaths(line);
-    if (diffPaths) {
-      pushMetadata();
-      oldPath = normalizePath(diffPaths.oldPath);
-      file = normalizePath(diffPaths.path);
-      hunkIndex = -1;
-      binary = false;
-      renamed = oldPath !== file;
-      continue;
-    }
-    if (!file) continue;
-    if ((match = /^rename from (.+)$/.exec(line))) {
-      oldPath = normalizePath(decodeGitPath(match[1]));
-      renamed = true;
-      continue;
-    }
-    if ((match = /^rename to (.+)$/.exec(line))) {
-      file = normalizePath(decodeGitPath(match[1]));
-      renamed = true;
-      continue;
-    }
-    if (/^(GIT binary patch|Binary files? )/.test(line)) {
-      binary = true;
-      continue;
-    }
-    if ((match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/.exec(line))) {
-      pushHunk();
-      hunkIndex++;
-      const facts = filesByPath.get(file);
-      hunk = {
+    parsed.hunks.forEach((hunk, hunkIndex) => {
+      const change: PatchChange = {
         id: `${file}#h${hunkIndex}`,
         file,
-        oldFile: oldPath || file,
+        oldFile,
         hunk: hunkIndex,
-        header: match[5].trim(),
-        oldRange: parseRange(match[1], match[2]),
-        newRange: parseRange(match[3], match[4]),
+        header: hunk.section,
+        oldRange: parseRange(hunk.oldStart, hunk.oldCount),
+        newRange: parseRange(hunk.newStart, hunk.newCount),
         hunks: [hunkIndex],
         rows: [],
         added: [],
@@ -229,23 +165,40 @@ export function parsePatchChanges(text: string, preflight: PreflightLike = {}): 
         fileType: facts?.type ?? "other",
         renamed,
       };
-      oldLine = Number(match[1]);
-      newLine = Number(match[3]);
-      continue;
-    }
-    if (!hunk) continue;
-    if (line.startsWith("+") && !line.startsWith("+++")) {
-      hunk.added.push(line.slice(1));
-      hunk.rows.push(`${file}#h${hunkIndex}:a${newLine++}`);
-    } else if (line.startsWith("-") && !line.startsWith("---")) {
-      hunk.deleted.push(line.slice(1));
-      hunk.rows.push(`${file}#h${hunkIndex}:d${oldLine++}`);
-    } else if (line.startsWith(" ")) {
-      oldLine++;
-      newLine++;
-    }
+      for (const line of hunk.lines) {
+        if (line.kind === "add") {
+          change.added.push(line.text);
+          change.rows.push(`${file}#h${hunkIndex}:a${line.newNo}`);
+        } else if (line.kind === "del") {
+          change.deleted.push(line.text);
+          change.rows.push(`${file}#h${hunkIndex}:d${line.oldNo}`);
+        }
+      }
+      changes.push(change);
+    });
+    if (parsed.hunks.length || changes.some((change) => change.file === file)) continue;
+    changes.push({
+      id: `${file}#meta`,
+      file,
+      oldFile,
+      hunk: null,
+      header: parsed.binary
+        ? "Binary change"
+        : renamed
+          ? "Rename metadata"
+          : "Metadata-only change",
+      oldRange: null,
+      newRange: null,
+      hunks: [],
+      rows: [],
+      added: [],
+      deleted: [],
+      binary: parsed.binary || Boolean(facts?.binary),
+      generated: Boolean(facts?.generated),
+      fileType: facts?.type ?? "other",
+      renamed,
+    });
   }
-  pushMetadata();
   return changes;
 }
 
@@ -255,8 +208,13 @@ function isLockfile(file: string): boolean {
 
 function isFormatting(change: PatchChange): boolean {
   if (!change.added.length || !change.deleted.length) return false;
+  // Leading whitespace is syntax in indentation-sensitive files, and a CR is
+  // a line-ending change, so neither counts as formatting-only there.
+  const indentSensitive = INDENT_SENSITIVE_RE.test(change.file);
   const visibleLines = (lines: readonly string[]): string[] =>
-    lines.map((line) => line.trimStart()).filter((line) => line.trim());
+    lines
+      .map((line) => (indentSensitive ? line : line.replace(/^[ \t\f\v]+/, "")))
+      .filter((line) => !/^[ \t\f\v]*$/.test(line));
   const added = visibleLines(change.added);
   const deleted = visibleLines(change.deleted);
   return added.length === deleted.length && added.every((line, index) => line === deleted[index]);
