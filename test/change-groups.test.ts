@@ -12,6 +12,7 @@ import {
 } from "../scripts/lib/change-groups.mjs";
 import { analyzePatch } from "../scripts/lib/preflight.mjs";
 import { validateReviewSpec } from "../scripts/lib/review-spec.mjs";
+import { createReviewData, type EmbeddedReviewData } from "../src/review-data.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -249,14 +250,11 @@ test("builder consumes group files as reviewer-visible, read-only decisions", (t
   const embeddedData =
     /<script id="review-data" type="application\/json">([\s\S]*?)<\/script>/.exec(html);
   assert.ok(embeddedData);
-  const renderedFiles = Object.entries(
-    JSON.parse(embeddedData[1]) as Record<
-      string,
-      { path: string; hunks: Array<{ rows: Array<{ c: string }> }> }
-    >,
-  )
-    .filter(([key]) => key.includes("__cg"))
-    .map(([, file]) => file);
+  const raw = JSON.parse(embeddedData[1]) as EmbeddedReviewData;
+  const data = createReviewData(raw);
+  const renderedFiles = Object.keys(raw.views)
+    .filter((key) => key.includes("__cg"))
+    .flatMap((key) => data.view(key) ?? []);
   const mixedViews = renderedFiles.filter((file) => file.path === "src/mixed.cpp");
   const includeView = mixedViews.find((file) =>
     file.hunks.some((hunk) => hunk.rows.some((row) => row.c.includes('#include "trace.h"'))),

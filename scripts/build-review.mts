@@ -12,7 +12,6 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { performance } from "node:perf_hooks";
@@ -128,11 +127,14 @@ interface DiffRow {
   text: string;
   oldNo?: number;
   newNo?: number;
-  html?: string;
+  /** Word-diff ranges as flat [start, end, ...] offsets into `text`. */
+  wordDiff?: number[];
 }
 
 interface DiffHunk {
   header: string;
+  oldStart: number;
+  newStart: number;
   rows: DiffRow[];
 }
 
@@ -148,41 +150,46 @@ interface ParsedDiffFile {
   isDeleted?: boolean;
 }
 
-interface ClientRow {
-  t: "a" | "d" | "c";
-  h: string;
-  c: string;
-  o?: number;
-  n?: number;
-  f: string;
-  cf: string;
+// The embedded data shape; src/review-data.ts decodes it in the browser.
+interface FullFile {
+  revision: "head" | "base";
+  content?: string;
+  unavailable?: "binary" | "too-large" | "missing";
+  svgPreview?: string;
 }
 
-interface ClientHunk {
+interface EmbeddedHunk {
   header: string;
-  rows: ClientRow[];
+  o: number;
+  n: number;
+  rows: string[];
+  w?: Record<string, number[]>;
 }
 
-interface ClientFileData {
+interface EmbeddedFile {
+  reviewTarget: string;
   path: string;
   oldPath: string;
-  renamed: boolean;
-  isNew: boolean;
-  isDeleted: boolean;
-  binary: boolean;
+  renamed?: boolean;
+  isNew?: boolean;
+  isDeleted?: boolean;
+  binary?: boolean;
   add: number;
   del: number;
   lang: string;
-  hunks: ClientHunk[];
-  reviewTarget: string;
-  fingerprint: string;
   note?: string;
-  fullFile: {
-    revision: "head" | "base";
-    content?: string;
-    unavailable?: "binary" | "too-large" | "missing";
-    svgPreview?: string;
-  };
+  fullFile: FullFile;
+  hunks: EmbeddedHunk[];
+}
+
+interface EmbeddedView {
+  f: number;
+  h?: number[][];
+}
+
+interface DataBag {
+  files: EmbeddedFile[];
+  views: Record<string, EmbeddedView>;
 }
 
 interface FileContentsBundle {
@@ -218,7 +225,6 @@ type RenderableGrouping = ChangeGrouping & {
   >;
 };
 
-type DataBag = Record<string, ClientFileData>;
 type ReviewBag = Record<string, NormalizedReview>;
 type GithubBag = Record<
   string,
@@ -232,7 +238,8 @@ type GithubBag = Record<
 
 interface FileBlock {
   fid: string;
-  d: ClientFileData;
+  d: EmbeddedFile;
+  view: EmbeddedView;
   changeId?: string;
   changeLabel?: string;
   viewKey?: string;
@@ -303,9 +310,6 @@ function generationTimestamp(date = new Date()): string {
     `${pad(date.getHours())}:${pad(date.getMinutes())}`
   );
 }
-
-const fingerprint = (value: unknown): string =>
-  createHash("sha256").update(String(value)).digest("hex").slice(0, 20);
 
 function safeUrl(value: unknown, { fragment = true }: { fragment?: boolean } = {}): string {
   const source = String(value || "").trim();
@@ -582,17 +586,24 @@ function lcsMask(
   }
   return { aKeep, bKeep };
 }
-function wordDiff(oldText: string, newText: string): { oldHtml: string; newHtml: string } {
+// Changed tokens as flat [start, end, ...] offsets; adjacent tokens merge.
+function wordDiff(oldText: string, newText: string): { oldRanges: number[]; newRanges: number[] } {
   const a = tokenize(oldText),
     b = tokenize(newText);
   const { aKeep, bKeep } = lcsMask(a, b);
-  const render = (toks: readonly string[], keep: readonly boolean[]): string =>
-    toks
-      .map((t, idx) =>
-        keep[idx] || /^\s+$/.test(t) ? esc(t) : `<span class="wd">${esc(t)}</span>`,
-      )
-      .join("");
-  return { oldHtml: render(a, aKeep), newHtml: render(b, bKeep) };
+  const ranges = (toks: readonly string[], keep: readonly boolean[]): number[] => {
+    const out: number[] = [];
+    let offset = 0;
+    toks.forEach((t, idx) => {
+      if (!keep[idx] && !/^\s+$/.test(t)) {
+        if (out.length && out[out.length - 1] === offset) out[out.length - 1] = offset + t.length;
+        else out.push(offset, offset + t.length);
+      }
+      offset += t.length;
+    });
+    return out;
+  };
+  return { oldRanges: ranges(a, aKeep), newRanges: ranges(b, bKeep) };
 }
 
 const WORD_DIFF_MAX_TOKENS = 240;
@@ -675,6 +686,8 @@ function parseDiff(text: string): ParsedDiffFile[] {
     oldPath: file.oldPath,
     hunks: file.hunks.map((hunk): DiffHunk => ({
       header: hunk.section,
+      oldStart: hunk.oldStart,
+      newStart: hunk.newStart,
       rows: hunk.lines.map((line) => ({
         type: line.kind,
         text: line.text,
@@ -717,9 +730,9 @@ function annotateWordDiffs(rows: DiffRow[]): void {
         wordDiffStats.skipped++;
         continue;
       }
-      const { oldHtml, newHtml } = wordDiff(oldText, newText);
-      del.html = oldHtml;
-      add.html = newHtml;
+      const { oldRanges, newRanges } = wordDiff(oldText, newText);
+      if (oldRanges.length) del.wordDiff = oldRanges;
+      if (newRanges.length) add.wordDiff = newRanges;
       wordDiffStats.applied++;
     }
     i = a - 1;
@@ -818,38 +831,33 @@ function langOf(p: string): string {
 }
 
 // ---------- structured file data (rendered client-side) ----------
-function fileData(file: ParsedDiffFile, reviewTarget = ""): ClientFileData {
-  const renamed = Boolean(
-    file.oldPath && file.oldPath !== file.path && !file.isNew && !file.isDeleted,
-  );
-  const d: ClientFileData = {
+const ROW_MARKERS: Readonly<Record<DiffRowType, string>> = { add: "+", del: "-", ctx: " " };
+
+function isRenamed(file: ParsedDiffFile): boolean {
+  return Boolean(file.oldPath && file.oldPath !== file.path && !file.isNew && !file.isDeleted);
+}
+
+// One stored entry per changed file; views select hunks and rows from it.
+function embeddedFile(
+  file: ParsedDiffFile,
+  reviewTarget: string,
+  fullFile: FullFile,
+): EmbeddedFile {
+  const renamed = isRenamed(file);
+  const d: EmbeddedFile = {
+    reviewTarget,
     path: file.path,
     oldPath: file.oldPath,
-    renamed,
-    isNew: !!file.isNew,
-    isDeleted: !!file.isDeleted,
-    binary: !!file.binary,
+    ...(renamed ? { renamed } : {}),
+    ...(file.isNew ? { isNew: true } : {}),
+    ...(file.isDeleted ? { isDeleted: true } : {}),
+    ...(file.binary ? { binary: true } : {}),
     add: file.add,
     del: file.del,
     lang: langOf(file.path),
+    fullFile,
     hunks: [],
-    reviewTarget,
-    fingerprint: "",
-    fullFile: {
-      revision: file.isDeleted ? "base" : "head",
-      unavailable: file.binary ? "binary" : "missing",
-    },
   };
-  d.fingerprint = fingerprint(
-    [
-      file.path,
-      file.oldPath,
-      ...file.hunks.flatMap((hunk) => [
-        hunk.header,
-        ...hunk.rows.map((row) => `${row.type}:${row.oldNo ?? ""}:${row.newNo ?? ""}:${row.text}`),
-      ]),
-    ].join("\n"),
-  );
   if (file.binary) {
     d.note = "Binary file not shown";
     return d;
@@ -866,28 +874,21 @@ function fileData(file: ParsedDiffFile, reviewTarget = ""): ClientFileData {
   }
   for (const h of file.hunks) {
     annotateWordDiffs(h.rows);
-    const rows = h.rows.map((r, rowIndex) => {
-      const o: ClientRow = {
-        t: r.type === "add" ? "a" : r.type === "del" ? "d" : "c",
-        h: r.html != null ? r.html : esc(r.text),
-        c: r.text,
-        f: "",
-        cf: "",
-      };
-      if (r.oldNo != null && r.type !== "add") o.o = r.oldNo;
-      if (r.newNo != null && r.type !== "del") o.n = r.newNo;
-      const before = h.rows[rowIndex - 1]?.text || "";
-      const after = h.rows[rowIndex + 1]?.text || "";
-      o.f = fingerprint(`${file.path}\0${r.type}\0${before}\0${r.text}\0${after}`);
-      o.cf = fingerprint(`${file.path}\0${r.type}\0${r.text}`);
-      return o;
+    const hunk: EmbeddedHunk = {
+      header: h.header,
+      o: h.oldStart,
+      n: h.newStart,
+      rows: h.rows.map((r) => ROW_MARKERS[r.type] + r.text),
+    };
+    h.rows.forEach((r, index) => {
+      if (r.wordDiff) (hunk.w ??= {})[index] = r.wordDiff;
     });
-    d.hunks.push({ header: h.header, rows });
+    d.hunks.push(hunk);
   }
   return d;
 }
 
-function readFileContents(pr: ReviewTarget): Map<string, ClientFileData["fullFile"]> {
+function readFileContents(pr: ReviewTarget): Map<string, FullFile> {
   if (!pr.fileContentsFile) return new Map();
   const bundlePath = path.isAbsolute(pr.fileContentsFile)
     ? pr.fileContentsFile
@@ -1100,19 +1101,22 @@ function renderPr(
   const { text, warning } = readDiff(pr);
   const files = parseDiff(text);
   const fullFiles = readFileContents(pr);
-  const buildFileData = (file: ParsedDiffFile): ClientFileData => {
-    const data = fileData(file, prId);
-    data.fullFile =
-      fullFiles.get(file.path) ||
-      ({
-        revision: file.isDeleted ? "base" : "head",
-        unavailable: file.binary ? "binary" : "missing",
-      } as const);
-    if (typeof data.fullFile.content === "string" && data.path.toLowerCase().endsWith(".svg")) {
-      data.fullFile.svgPreview = sanitizeSvg(data.fullFile.content);
+  // Each parsed file is stored once; every rendered block is a view of it.
+  const storedFiles = files.map((file) => {
+    const fullFile: FullFile = {
+      ...(fullFiles.get(file.path) ||
+        ({
+          revision: file.isDeleted ? "base" : "head",
+          unavailable: file.binary ? "binary" : "missing",
+        } as const)),
+    };
+    if (typeof fullFile.content === "string" && file.path.toLowerCase().endsWith(".svg")) {
+      fullFile.svgPreview = sanitizeSvg(fullFile.content);
     }
-    return data;
-  };
+    dataBag.files.push(embeddedFile(file, prId, fullFile));
+    return { index: dataBag.files.length - 1, d: dataBag.files[dataBag.files.length - 1] };
+  });
+  const storedByParsed = new Map(files.map((file, index) => [file, storedFiles[index]]));
   const changeGroups = resolveChangeGroups(pr, text);
   const warnHtml = warning ? `<div class="warn">⚠ ${esc(warning)}</div>` : "";
   const totals = files.reduce((t, f) => ({ add: t.add + f.add, del: t.del + f.del }), {
@@ -1121,15 +1125,16 @@ function renderPr(
   });
 
   // one block per file (diff filled client-side); optionally arranged into groups
-  const fileBlocks = files.map((f, i) => {
-    const fid = `${prId}__${i}`;
-    dataBag[fid] = buildFileData(f);
-    return { fid, d: dataBag[fid] };
-  });
+  const fileBlocks: FileBlock[] = storedFiles.map(({ index, d }, i) => ({
+    fid: `${prId}__${i}`,
+    d,
+    view: { f: index },
+  }));
   const renderFileBlock = (
-    { fid, d, changeId, changeLabel, viewKey }: FileBlock,
+    { fid, d, view, changeId, changeLabel, viewKey }: FileBlock,
     collapsed: boolean,
   ): string => {
+    dataBag.views[fid] = view;
     const pathLabel = d.renamed ? `${esc(d.oldPath)} → ${esc(d.path)}` : esc(d.path);
     const tag = d.isNew
       ? '<span class="ftag ftag-new">new</span>'
@@ -1198,18 +1203,20 @@ function renderPr(
         <div class="group-files">${gblocks.map((b) => renderFileBlock(b, collapsedFiles)).join("\n")}</div>
       </div>`;
   };
+  // The Git-order view starts hidden, so it ships inert in a <template> and
+  // the client materializes it the first time it is opened.
   const renderRawOrder = () =>
-    files
-      .map((file, index) => {
-        const fid = `${prId}__raw__${index}`;
-        const d = buildFileData(file);
-        dataBag[fid] = d;
-        return renderFileBlock({ fid, d, viewKey: `raw::${d.path}` }, false);
-      })
-      .join("\n");
+    `<template data-lazy-view>${storedFiles
+      .map(({ index, d }, i) =>
+        renderFileBlock(
+          { fid: `${prId}__raw__${i}`, d, view: { f: index }, viewKey: `raw::${d.path}` },
+          false,
+        ),
+      )
+      .join("\n")}</template>`;
   // pure renames (moved, no textual change) are noise to review one-by-one —
   // auto-collect them into a collapsed group once there are a few of them.
-  const isPureRename = (b: FileBlock): boolean => b.d.renamed && b.d.add === 0 && b.d.del === 0;
+  const isPureRename = (b: FileBlock): boolean => !!b.d.renamed && b.d.add === 0 && b.d.del === 0;
   const RENAME_GROUP: RenderGroup = {
     id: "__renames",
     title: "Renamed (no content change)",
@@ -1225,8 +1232,7 @@ function renderPr(
       const sourceGroup = changeGroups.groups.find((candidate) => candidate.id === sourceGroupId);
       for (const change of sourceGroup?.changes || []) {
         const parsed = parsedByPath.get(change.file);
-        if (!parsed) continue;
-        const d = buildFileData(parsed);
+        if (!parsed || parsed.binary) continue;
         const selectedIndexes =
           change.hunks?.length > 0
             ? change.hunks
@@ -1235,16 +1241,16 @@ function renderPr(
               : [];
         const hunks = selectedIndexes.length
           ? selectedIndexes
-              .map((hunk) => d.hunks[hunk])
-              .filter((hunk): hunk is ClientHunk => hunk !== undefined)
-          : d.hunks;
+              .map((hunk) => parsed.hunks[hunk])
+              .filter((hunk): hunk is DiffHunk => hunk !== undefined)
+          : parsed.hunks;
         const row = hunks
-          .flatMap((hunk) => hunk.rows || [])
+          .flatMap((hunk) => hunk.rows)
           .find(
             (candidate) =>
-              candidate.t === "a" && extractDefinedSymbols([candidate.c]).includes(symbol),
+              candidate.type === "add" && extractDefinedSymbols([candidate.text]).includes(symbol),
           );
-        if (row) return row.c;
+        if (row) return row.text;
       }
       return symbol;
     };
@@ -1296,8 +1302,12 @@ function renderPr(
       }
       for (const [fileIndex, [file, fileChanges]] of [...changesByFile].entries()) {
         const parsed = parsedByPath.get(file);
-        if (!parsed) continue;
-        const d = buildFileData(parsed);
+        const stored = parsed && storedByParsed.get(parsed);
+        if (!parsed || !stored) continue;
+        const view: EmbeddedView = { f: stored.index };
+        let add = stored.d.add;
+        let del = stored.d.del;
+        const hunks = parsed.binary ? [] : parsed.hunks;
         const selectedRows = new Set(fileChanges.flatMap((change) => change.rows || []));
         const selectedHunks = [
           ...new Set(
@@ -1310,32 +1320,44 @@ function renderPr(
             ),
           ),
         ];
+        const countRows = (rows: readonly DiffRow[]): void => {
+          add += rows.filter((row) => row.type === "add").length;
+          del += rows.filter((row) => row.type === "del").length;
+        };
         if (selectedRows.size) {
-          d.hunks = d.hunks.flatMap((hunk, hunkIndex) => {
-            const rows = hunk.rows.filter((row) => {
-              if (row.t === "c") return true;
-              const line = row.t === "a" ? row.n : row.o;
-              const side = row.t === "a" ? "a" : "d";
+          view.h = [];
+          add = del = 0;
+          hunks.forEach((hunk, hunkIndex) => {
+            const keep = hunk.rows.map((row) => {
+              if (row.type === "ctx") return true;
+              const line = row.type === "add" ? row.newNo : row.oldNo;
+              const side = row.type === "add" ? "a" : "d";
               return line !== undefined && selectedRows.has(`${file}#h${hunkIndex}:${side}${line}`);
             });
-            return rows.some((row) => row.t !== "c") ? [{ ...hunk, rows }] : [];
+            const kept = hunk.rows.filter((_row, index) => keep[index]);
+            if (!kept.some((row) => row.type !== "ctx")) return;
+            countRows(kept);
+            const selection = [hunkIndex];
+            if (kept.length < hunk.rows.length) {
+              keep.forEach((on, index) => {
+                if (!on) return;
+                if (selection.length > 1 && selection[selection.length - 1] === index) {
+                  selection[selection.length - 1] = index + 1;
+                } else selection.push(index, index + 1);
+              });
+            }
+            view.h?.push(selection);
           });
-          const rows = d.hunks.flatMap((hunk) => hunk.rows);
-          d.add = rows.filter((row) => row.t === "a").length;
-          d.del = rows.filter((row) => row.t === "d").length;
         } else if (selectedHunks.length) {
-          d.hunks = selectedHunks
-            .map((hunk) => d.hunks[hunk])
-            .filter((hunk): hunk is ClientHunk => hunk !== undefined);
-          const rows = d.hunks.flatMap((hunk) => hunk.rows);
-          d.add = rows.filter((row) => row.t === "a").length;
-          d.del = rows.filter((row) => row.t === "d").length;
+          view.h = selectedHunks.filter((hunk) => hunks[hunk] !== undefined).map((hunk) => [hunk]);
+          add = del = 0;
+          view.h.forEach(([hunk]) => countRows(hunks[hunk].rows));
         }
         const fid = `${prId}__cg${orderIndex.get(group.id) ?? 0}__${fileIndex}`;
-        dataBag[fid] = d;
         blocks.push({
           fid,
-          d,
+          d: { ...stored.d, add, del },
+          view,
           changeId: fileChanges.map((change) => change.id).join(","),
           changeLabel: `${fileChanges.length} change unit${fileChanges.length === 1 ? "" : "s"}`,
           viewKey: `${group.id}::${file}`,
@@ -1539,7 +1561,7 @@ function main(): void {
         .join("");
 
   const reviewer = "LM";
-  const dataBag: DataBag = {};
+  const dataBag: DataBag = { files: [], views: {} };
   const reviewBag: ReviewBag = {};
   const githubBag: GithubBag = {};
   prs.forEach((pr, index) => {
