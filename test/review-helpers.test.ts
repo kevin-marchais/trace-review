@@ -57,7 +57,7 @@ test("hunk gaps locate rows hidden by a group filter", () => {
     { t: "c", o: 288, n: 289 },
     { t: "c", o: 294, n: 295 },
   ]);
-  assert.deepEqual([...fallback.before], [[1, 10]]);
+  assert.deepEqual([...fallback.before], [[1, 5]]);
   assert.equal(fallback.after, 0);
   assert.equal(hunkGaps(original, original).before.size, 0);
 });

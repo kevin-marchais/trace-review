@@ -214,7 +214,7 @@ function isFormatting(change: PatchChange): boolean {
   const visibleLines = (lines: readonly string[]): string[] =>
     lines
       .map((line) => (indentSensitive ? line : line.replace(/^[ \t\f\v]+/, "")))
-      .filter((line) => !/^[ \t\f\v]*$/.test(line));
+      .filter((line) => !/^[ \t\f\v]*\r?$/.test(line));
   const added = visibleLines(change.added);
   const deleted = visibleLines(change.deleted);
   return added.length === deleted.length && added.every((line, index) => line === deleted[index]);
