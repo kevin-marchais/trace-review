@@ -188,8 +188,26 @@ function reserveUniqueReviewPath(preferredPath: string): {
   }
 }
 
+// git reports the canonical root while outputDir follows --repo, so compare real
+// paths (macOS /private/var, Windows 8.3 names, symlinked checkouts).
+function samePath(left: string, right: string): boolean {
+  const canonical = (value: string): string => {
+    const resolved = path.resolve(value);
+    let real = resolved;
+    try {
+      real = fs.realpathSync.native(resolved);
+    } catch {
+      try {
+        real = path.join(fs.realpathSync.native(path.dirname(resolved)), path.basename(resolved));
+      } catch {}
+    }
+    return process.platform === "win32" ? real.toLowerCase() : real;
+  };
+  return canonical(left) === canonical(right);
+}
+
 function ensureReviewExcluded(repositoryRoot: string, outputDir: string): void {
-  if (path.resolve(outputDir) !== path.join(path.resolve(repositoryRoot), ".review")) return;
+  if (!samePath(outputDir, path.join(repositoryRoot, ".review"))) return;
   // Leave the exclude file alone when .gitignore (or anything else) already ignores it.
   const ignored = spawnSync("git", ["check-ignore", "--quiet", "--", ".review/"], {
     cwd: repositoryRoot,
@@ -613,9 +631,9 @@ function reviewContentKey(contextPath: string, fallbackHeadSha: string): string 
     context = readJson<typeof context>(contextPath);
   } catch {}
   const github = context.source === "github";
-  const baseSha = github
-    ? context.pullRequest?.baseSha || ""
-    : context.git?.baseSha || context.git?.baseRef || "";
+  // A PR's baseSha is the moving tip of its base branch, so PRs are keyed on the
+  // head alone; otherwise each merge into the base would drop draft comments.
+  const baseSha = github ? "" : context.git?.baseSha || context.git?.baseRef || "";
   const headSha = github
     ? context.pullRequest?.headSha || fallbackHeadSha
     : context.git?.headSha || fallbackHeadSha;
